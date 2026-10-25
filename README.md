@@ -7,7 +7,7 @@
 
 # ⬢ hydra-cli
 
-[![version](https://img.shields.io/badge/version-2.9.1-dc143c?style=flat-square)]()
+[![version](https://img.shields.io/badge/version-2.9.2-dc143c?style=flat-square)]()
 [![deps](https://img.shields.io/badge/dependencies-0-2fae62?style=flat-square)]()
 [![node](https://img.shields.io/badge/node-%E2%89%A520-2fae62?style=flat-square)]()
 [![license](https://img.shields.io/badge/license-MIT-8a8a8a?style=flat-square)](LICENSE)
@@ -127,6 +127,8 @@ sequenceDiagram
 | build / plan mode | `ctrl+p` or `tab` |
 | scrollback | `pgup / pgdn`, `shift+↑/↓`, mouse wheel |
 | queue a switch mid-reply | `/sessions` works **while a turn is running** — it switches automatically after the reply |
+| `/model <n\|name>` | switch model — the list **always refreshes for the active provider**, so `qwen` and cloud models never get tangled |
+| `/provider use <name>` | flip back to a previous provider (e.g. `/provider use ollama`) |
 | paste / copy | `ctrl+v` · drag-select ships straight to the clipboard |
 | markdown export | `/export file.md` |
 | shell | `! <command>` |

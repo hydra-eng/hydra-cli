@@ -10,7 +10,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { spawnSync } from "node:child_process";
 
-const VERSION = "2.9.1";
+const VERSION = "2.9.2";
 const ESC = String.fromCharCode(27);
 let CRIMSON = ESC + "[91m";
 let CRIMSONBG = ESC + "[0;48;2;220;20;60m";
@@ -332,7 +332,7 @@ async function fetchModelsFor(baseURL, apiKey) {
   const r = await fetch(String(baseURL).replace(/\/$/, "") + "/models", { headers, signal: AbortSignal.timeout(15000) });
   const j = await r.json();
   if (j.error) throw new Error(j.error.message || j.error);
-  lastModels = (j.data || j.models || []).map((m) => m.id || m.name || String(m)).filter(Boolean).sort();
+  lastModels = (j.data || j.models || []).map((m) => String(m.id || m.name || m).replace(/^models\//, "")).filter(Boolean).sort();
   return lastModels;
 }
 
@@ -349,7 +349,7 @@ function providerListLines() {
 function providerUseLines(name) {
   loadCfg();
   if (!CFG.providers[name]) return [cc("\u001b[31m", ` no provider named '${name}'`)];
-  CFG.active = name; saveCfg();
+  CFG.active = name; lastModels = []; saveCfg();
   return [` provider -> ${cc(CRIMSON + BOLD, name)} ${cc(DIM, activeProvider().model)}`];
 }
 function providerAddLines(name, baseURL, apiKey, model) {
@@ -376,6 +376,7 @@ const KEY_VENDORS = [
   [/^sk-/, { name: "openai", baseURL: "https://api.openai.com/v1" }],
   [/^gsk_/, { name: "groq", baseURL: "https://api.groq.com/openai/v1" }],
   [/^AIza/, { name: "gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai" }],
+  [/^AQ\./, { name: "gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai" }],
   [/^hf_/, { name: "huggingface", baseURL: "https://router.huggingface.co/v1" }],
   [/^nvapi-/, { name: "nvidia", baseURL: "https://integrate.api.nvidia.com/v1" }],
 ];
@@ -421,7 +422,7 @@ async function keyPasteLines(key) {
 async function modelListLines() {
   loadCfg();
   const p = activeProvider();
-  if (!lastModels.length) await fetchModels();
+  try { await fetchModels(); } catch { lastModels = []; }
   const lines = [` Models on ${cc(CRIMSON + BOLD, p.name)}: ${cc(DIM, p.baseURL)}`, ""];
   lastModels.forEach((m, i) => {
     const active = m === p.model;
@@ -435,15 +436,13 @@ async function modelUseLines(arg) {
   arg = String(arg || "").trim();
   if (!arg) return [cc(DIM, " usage: /model <number> or /model <partial name>")];
   loadCfg();
-  if (!lastModels.length) {
-    try { await fetchModels(); }
-    catch (e) {
-      if (arg.includes("/")) {
-        CFG.providers[CFG.active].model = arg; saveCfg();
-        return [` model -> ${cc(CRIMSON + BOLD, arg)} ${cc(DIM, "(forced, list fetch failed)")}`];
-      }
-      return [cc("\u001b[31m", " error: " + e.message)];
+  try { await fetchModels(); }
+  catch (e) {
+    if (arg.includes("/")) {
+      CFG.providers[CFG.active].model = arg; saveCfg();
+      return [` model -> ${cc(CRIMSON + BOLD, arg)} ${cc(DIM, "(forced, list fetch failed)")}`];
     }
+    return [cc("\u001b[31m", " error: " + e.message)];
   }
   let pick = null;
   if (/^\d+$/.test(arg)) pick = lastModels[Number(arg) - 1] || null;
@@ -1262,7 +1261,7 @@ async function openModelPopup() {
   closePopup();
   setUserInput("");
   startBusy("fetching models");
-  try { if (!lastModels.length) await fetchModels(); }
+  try { await fetchModels(); }
   catch (e) { stopBusy(); addLog(cc("\u001b[31m", " model fetch failed: " + e.message)); return; }
   stopBusy();
   const p = activeProvider();
@@ -1986,7 +1985,6 @@ function plainSession() {
         (await keyPasteLines(q.replace("/key", "").trim())).forEach((l) => console.log(stripAnsi(l)));
       } else if (q === "/model") { (await modelListLines()).forEach((l) => console.log(stripAnsi(l))); }
       else if (q.startsWith("/model ")) {
-        if (!lastModels.length) { try { await fetchModels(); } catch (e) { console.log("fetch failed: " + e.message); } }
         (await modelUseLines(q.replace("/model", "").trim())).forEach((l) => console.log(stripAnsi(l)));
       } else if (q.startsWith("/cd")) {
         const arg = q.replace("/cd", "").trim();
@@ -2268,6 +2266,39 @@ async function main() {
       setTimeout(() => send("", { name: "return" }), 20100);
     }
     setTimeout(() => process.exit(0), shot === 1 ? 14700 : shot === 2 ? 18400 : 24500);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "11") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // /model refresh + provider switching: each provider gets its OWN list (stale cache regression)
+    const httpm = await import("node:http");
+    const srv = httpm.createServer((req, res) => {
+      const auth = req.headers.authorization || "";
+      const body = auth === "Bearer key-old"
+        ? JSON.stringify({ data: [{ id: "alpha-old" }, { id: "beta-old" }] })
+        : JSON.stringify({ data: [{ id: "gamma-new" }, { id: "delta-new" }] });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(body);
+    });
+    await new Promise((ok) => srv.listen(7078, "127.0.0.1", ok));
+    srv.unref?.();
+    loadCfg();
+    CFG.providers["prov-a"] = { name: "prov-a", baseURL: "http://127.0.0.1:7078/v1", apiKey: "key-old", model: "alpha-old" };
+    CFG.providers["prov-b"] = { name: "prov-b", baseURL: "http://127.0.0.1:7078/v1", apiKey: "key-new", model: "gamma-new" };
+    CFG.active = "prov-a";
+    saveCfg();
+    setTimeout(() => { "/model".split("").forEach((c) => send(c)); }, 2400);
+    setTimeout(() => send("", { name: "return" }), 3000);          // list prov-a: alpha/beta
+    setTimeout(() => send("", { name: "down" }), 3400);            // hover beta-old
+    setTimeout(() => send("", { name: "return" }), 3600);          // switch -> beta-old
+    setTimeout(() => { "/provider use prov-b".split("").forEach((c) => send(c)); }, 5200);
+    setTimeout(() => send("", { name: "return" }), 5600);          // switch provider (cache must reset)
+    setTimeout(() => { "/model alpha-old".split("").forEach((c) => send(c)); }, 7200);
+    setTimeout(() => send("", { name: "return" }), 7600);          // must NOT match: prov-b has no alpha-old
+    setTimeout(() => { "/model delta".split("").forEach((c) => send(c)); }, 9000);
+    setTimeout(() => send("", { name: "return" }), 9400);          // fresh list shows gamma/delta -> switch to delta
+    setTimeout(() => process.exit(0), 12500);
     return;
   }
   if (process.env.HYDRA_TEST) {
