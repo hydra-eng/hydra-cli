@@ -14,8 +14,8 @@
 
 **A cinematic, zero-dependency terminal AI CLI for Windows.** One file, `node`, nothing else.
 
-![hydra chat](docs/img/chat.svg)
-![hydra sessions](docs/img/sessions.svg)
+<img width="1916" height="1078" alt="Screenshot 2026-10-25 144658" src="https://github.com/user-attachments/assets/d2bc3948-5e00-4ac7-aee7-8d07d1a8356a" />
+
 
 </div>
 
