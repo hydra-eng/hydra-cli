@@ -7,7 +7,7 @@
 
 # ⬢ hydra-cli
 
-[![version](https://img.shields.io/badge/version-2.9.0-dc143c?style=flat-square)]()
+[![version](https://img.shields.io/badge/version-2.9.1-dc143c?style=flat-square)]()
 [![deps](https://img.shields.io/badge/dependencies-0-2fae62?style=flat-square)]()
 [![node](https://img.shields.io/badge/node-%E2%89%A520-2fae62?style=flat-square)]()
 [![license](https://img.shields.io/badge/license-MIT-8a8a8a?style=flat-square)](LICENSE)
@@ -29,7 +29,8 @@
 - **full-text session search** — `/search deep dive` finds the words across every past session and drops you in a pre-filtered picker.
 - **session forking** — `/fork 30` branches a long conversation up to a chosen turn into a brand-new session, like `git branch` for chat.
 - **palettes on the fly** — `/theme` swaps the whole UI between five hand-tuned palettes, instantly and persistently.
-- **bring any OpenAI-compatible endpoint** — `/provider` → `➕ other (custom API)` walks through name → baseURL → key (masked) → live `/models` fetch → pick.
+- **paste a key, done** — `/key <paste>` (or `➕ paste api key` in the provider popup) detects the vendor from the key's shape — zen, OpenAI, OpenRouter, Groq, Gemini, Hugging Face, NVIDIA — connects, lists models, auto-picks one. No baseURL questions. Ever.
+- **bring any OpenAI-compatible endpoint** — `/provider` → `➕ other (custom API)` still walks through name → baseURL → key (masked) → live `/models` fetch → pick when you want full control.
 - **terminal polish** — hand-drawn banner splash, double-width-safe wraps, frozen viewport while you scroll (new logs never yank your view), mouse wheel + click + drag-select, clipboard paste.
 
 ## 👼 palettes
@@ -133,7 +134,8 @@ sequenceDiagram
 ## ⚙️ providers & models
 
 ```
-/provider              popup: switch · ➕ other = custom API (name → baseURL → key → live models)
+/key <paste>           paste your api key -> vendor auto-detected -> connected. that's the whole flow.
+/provider              popup: switch · ➕ paste key (one step) · ➕ other = custom API (name → baseURL → key → live models)
 /provider add myapi https://api.example.com/v1 sk-... gpt-x
 /provider del myapi    /provider use myapi
 /model                 live model list for the active provider

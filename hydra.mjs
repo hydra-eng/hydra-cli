@@ -10,7 +10,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { spawnSync } from "node:child_process";
 
-const VERSION = "2.9.0";
+const VERSION = "2.9.1";
 const ESC = String.fromCharCode(27);
 let CRIMSON = ESC + "[91m";
 let CRIMSONBG = ESC + "[0;48;2;220;20;60m";
@@ -368,6 +368,56 @@ function providerDelLines(name) {
   return [` provider removed -> active: ${cc(CRIMSON + BOLD, CFG.active)}`];
 }
 
+// ---- paste-key connect: one step, any key accepted ( /key <paste> or provider popup )
+const KEY_VENDORS = [
+  [/^oc_sk_/, { name: "zen", baseURL: "https://opencode.ai/zen/v1" }],
+  [/^sk-or-/, { name: "openrouter", baseURL: "https://openrouter.ai/api/v1" }],
+  [/^sk-proj-/, { name: "openai", baseURL: "https://api.openai.com/v1" }],
+  [/^sk-/, { name: "openai", baseURL: "https://api.openai.com/v1" }],
+  [/^gsk_/, { name: "groq", baseURL: "https://api.groq.com/openai/v1" }],
+  [/^AIza/, { name: "gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai" }],
+  [/^hf_/, { name: "huggingface", baseURL: "https://router.huggingface.co/v1" }],
+  [/^nvapi-/, { name: "nvidia", baseURL: "https://integrate.api.nvidia.com/v1" }],
+];
+function detectVendor(key) {
+  for (const [rx, v] of KEY_VENDORS) if (rx.test(key)) return { name: v.name, baseURL: v.baseURL };
+  return { name: "openai", baseURL: "https://api.openai.com/v1" };
+}
+const CHEAP_MODEL_RX = /free|flash|mini|lite|small|nano|-\d+b|\d+b/i;
+function keySaveLines(v, key, model) {
+  CFG.providers[v.name] = { name: v.name, baseURL: v.baseURL, apiKey: key, model: model || (CFG.providers[v.name] ? CFG.providers[v.name].model : ""), keepAlive: "" };
+  CFG.active = v.name; saveCfg();
+}
+async function keyPasteLines(key) {
+  if (!key) return [cc(DIM, " paste a key first \u00b7 /key <your-key>")];
+  const v = detectVendor(key);
+  startBusy("connecting " + v.name);
+  let models = [];
+  try { models = await fetchModelsFor(v.baseURL, key); }
+  catch (e) {
+    stopBusy();
+    keySaveLines(v, key, "");
+    return [
+      cc("\u001b[31m", " couldn't verify " + v.baseURL + " (" + (e.message || e) + ") \u2014 key saved, will retry live on your first turn"),
+      cc(DIM, " wrong host for this key? override: /provider add <name> <baseURL> <key> <model> \u00b7 /model to pick"),
+    ];
+  }
+  stopBusy();
+  if (!models.length) {
+    keySaveLines(v, key, "");
+    return [
+      cc("\u001b[31m", " no models returned by " + v.baseURL + " \u2014 key saved"),
+      cc(DIM, " set one manually: /provider add " + v.name + " " + v.baseURL + " <key> <model>")
+    ];
+  }
+  const pick = models.find((m) => CHEAP_MODEL_RX.test(String(m))) || models[0];
+  keySaveLines(v, key, pick);
+  return [
+    ` \u26a1 ${cc(CRIMSON + BOLD, v.name)} connected -> ${cc(CRIMSON + BOLD, pick)}`,
+    cc(DIM, " one step, done \u00b7 /model to switch, /provider for the advanced flow"),
+  ];
+}
+
 async function modelListLines() {
   loadCfg();
   const p = activeProvider();
@@ -410,7 +460,8 @@ let HISTORY = [];
 let RESTORED = 0;
 const COMMANDS = [
   { name: "/model", desc: "switch model", hint: " [n|name]" },
-  { name: "/provider", desc: "switch provider Â· other = custom API", hint: "[name]" },
+  { name: "/provider", desc: "switch provider \u00b7 paste key = one step", hint: "[name]" },
+  { name: "/key", desc: "paste api key \u2014 auto-detects vendor, connects", hint: " <key>" },
   { name: "/sessions", desc: "session picker dialog", hint: "" },
   { name: "/export", desc: "export the active chat as markdown", hint: "[file]" },
   { name: "/rename", desc: "rename the active session", hint: "<title>" },
@@ -434,7 +485,9 @@ function helpLines() {
     "",
     cc(CRIMSON + BOLD, " Commands"),
     cc(DIM, " /model <n|name>      list + switch models"),
-    cc(DIM, " /provider <name>     popup: switch \u00b7 \u2795 other = name \u2192 baseURL \u2192 api key \u2192 live model list"),
+    cc(DIM, " /key <key>           paste api key \u2192 vendor auto-detected + connected in one step"),
+    cc(CRIMSON + BOLD, "                      zen \u00b7 openai \u00b7 openrouter \u00b7 groq \u00b7 gemini \u00b7 huggingface \u00b7 nvidia"),
+    cc(DIM, " /provider <name>     popup: switch \u00b7 \u2795 paste key (one step) \u00b7 \u2795 other = name \u2192 baseURL \u2192 api key"),
     cc(DIM, " /provider add <name> <baseURL> <apiKey> <model>"),
     cc(DIM, " /provider del <name> remove provider"),
     cc(DIM, " /cd <path>           change directory"),
@@ -727,7 +780,7 @@ function popupActivate() {
   closePopup(); setUserInput("");
   if (!it) return;
   if (popupKind() === "model") { startBusy("switching model"); ((async () => { try { addLogLines(await modelUseLines(String(Number(it.value) + 1))); } catch (e) { addLog(cc("\u001b[31m", " error: " + (e.message || e))); } stopBusy(); })()); return; }
-  if (popupKind() === "provider") { if (it.value === "other") { startCustomProvider(); return; } addLogLines(providerUseLines(it.value)); return; }
+  if (popupKind() === "provider") { if (it.value === "pastekey") { startPasteKeyCapture(); return; } if (it.value === "other") { startCustomProvider(); return; } addLogLines(providerUseLines(it.value)); return; }
   if (popupKind() === "custom") { providerPickModels(); return; }
   if (popupKind() === "skills") { injectSkillValue(it.value); return; }
   if (popupKind() === "theme") { applyTheme(String(it.value)); addLog(cc(CRIMSON + BOLD, "  palette -> " + it.value + " \u00b7 applies instantly, saved to config")); scheduleDraw(true); return; }
@@ -1219,12 +1272,20 @@ async function openProviderPopup() {
   closePopup();
   loadCfg();
   const items = Object.keys(CFG.providers).map((n) => ({ label: n, desc: n === CFG.active ? " active" : "", value: n }));
-  items.push({ label: "\u2795 other (custom API)", desc: " fetch its models", value: "other" });
+  items.push({ label: "\u2795 paste api key \u00b7 one step", desc: " detects the vendor, connects", value: "pastekey" });
+  items.push({ label: "\u2795 other (custom API)", desc: " name \u00b7 url \u00b7 key \u00b7 models", value: "other" });
   openPopup("provider \u2502 /provider <name>", items);
 }
 
 // ---- custom provider capture ( /provider -> other: name -> baseURL -> api key -> fetch models -> use )
-let CUSTOM_CAPTURE = null;   // { step:"name"|"base"|"key", name:"", base:"", mask:"" }
+let CUSTOM_CAPTURE = null;   // { step:"pastekey"|"name"|"base"|"key", name:"", base:"", mask:"" }
+function startPasteKeyCapture() {
+  closePopup();
+  CUSTOM_CAPTURE = { step: "pastekey", name: "", base: "", mask: "" };
+  setUserInput("");
+  addLog(cc(CRIMSON + BOLD, " \u2749 paste your api key (input hidden) \u2014 return = connect \u00b7 esc cancels"));
+  scheduleDraw(true);
+}
 function startCustomProvider() {
   closePopup();
   CUSTOM_CAPTURE = { step: "name", name: "", base: "", mask: "" };
@@ -1243,6 +1304,14 @@ async function customCaptureStep() {
   const cap = CUSTOM_CAPTURE;
   if (!cap) return;
   const v = UI.input.trim();
+  if (cap.step === "pastekey") {
+    const key = cap.mask.trim();
+    if (!key) { addLog(cc(DIM, " paste the key first \u00b7 esc cancels")); return; }
+    CUSTOM_CAPTURE = null; setUserInput("");
+    try { addLogLines(await keyPasteLines(key)); } catch (e) { addLog(cc("\u001b[31m", " " + (e.message || e))); }
+    scheduleDraw(true);
+    return;
+  }
   if (cap.step === "name") {
     if (!v || !/^[A-Za-z0-9_-]{1,24}$/.test(v)) { addLog(cc(DIM, " name: short letters/numbers/underscore, e.g. openai, groq, myproxy")); setUserInput(""); return; }
     if (CFG.providers[v]) addLog(cc(DIM, " \u26a0 '" + v + "' exists \u2014 it will be replaced"));
@@ -1325,6 +1394,7 @@ async function submitLine() {
   if (popupKind() === "provider") {
     const it = UI.popupItems[UI.popupSel];
     closePopup(); setUserInput("");
+    if (it && it.value === "pastekey") { startPasteKeyCapture(); return; }
     if (it && it.value === "other") { startCustomProvider(); return; }
     if (it) addLogLines(providerUseLines(it.value));
     return;
@@ -1358,6 +1428,12 @@ async function submitLine() {
     if (parts[0] === "add") { addLogLines(providerAddLines(parts[1], parts[2], parts[3], parts[4])); return; }
     if (parts[0] === "del") { addLogLines(providerDelLines(parts[1])); return; }
     addLogLines(providerListLines()); return;
+  }
+  if (q === "/key") { startPasteKeyCapture(); return; }
+  if (q.startsWith("/key ")) {
+    const arg = q.replace("/key", "").trim();
+    try { addLogLines(await keyPasteLines(arg)); } catch (e) { addLog(cc("\u001b[31m", " error: " + (e.message || e))); }
+    scheduleDraw(true); return;
   }
   if (q.startsWith("/cd")) {
     const arg = q.replace("/cd", "").trim();
@@ -1702,12 +1778,12 @@ function onKey(str, key) {
       if (key.name === "pagedown") { nudgeScroll(-Math.max(3, Math.floor(UI.rows / 3))); return; }
       if (key.name === "up" || key.name === "down") return;   // no prompt history while capturing
       if (key.name === "backspace") {
-        if (cap.step === "key") { cap.mask = cap.mask.slice(0, -1); setUserInput("\u2022".repeat(cap.mask.length)); }
+        if (cap.step === "key" || cap.step === "pastekey") { cap.mask = cap.mask.slice(0, -1); setUserInput("\u2022".repeat(cap.mask.length)); }
         else setUserInput(UI.input.slice(0, -1));
         return;
       }
       if (str && !key.ctrl && !key.meta && str.length === 1 && stripAnsi(str)) {
-        if (cap.step === "key") { cap.mask += str; setUserInput("\u2022".repeat(cap.mask.length)); }
+        if (cap.step === "key" || cap.step === "pastekey") { cap.mask += str; setUserInput("\u2022".repeat(cap.mask.length)); }
         else setUserInput(UI.input + str);
         scheduleDraw();
         return;
@@ -1906,6 +1982,8 @@ function plainSession() {
         else if (parts[0] === "add") providerAddLines(parts[1], parts[2], parts[3], parts[4]).forEach((l) => console.log(stripAnsi(l)));
         else if (parts[0] === "del") providerDelLines(parts[1]).forEach((l) => console.log(stripAnsi(l)));
         else providerListLines().forEach((l) => console.log(stripAnsi(l)));
+      } else if (q === "/key" || q.startsWith("/key ")) {
+        (await keyPasteLines(q.replace("/key", "").trim())).forEach((l) => console.log(stripAnsi(l)));
       } else if (q === "/model") { (await modelListLines()).forEach((l) => console.log(stripAnsi(l))); }
       else if (q.startsWith("/model ")) {
         if (!lastModels.length) { try { await fetchModels(); } catch (e) { console.log("fetch failed: " + e.message); } }
@@ -2114,8 +2192,9 @@ async function main() {
     setTimeout(() => { "/provider".split("").forEach((c) => send(c)); }, 2200);
     setTimeout(() => send("", { name: "return" }), 2600);          // provider popup
     setTimeout(() => send("", { name: "down" }), 2900);            // hover past configured providers
-    setTimeout(() => send("", { name: "down" }), 3000);            // hover the Other entry (last)
-    setTimeout(() => send("", { name: "return" }), 3100);          // start capture: name
+    setTimeout(() => send("", { name: "down" }), 3000);            // hover the paste-key entry
+    setTimeout(() => send("", { name: "down" }), 3100);            // hover the Other entry (last)
+    setTimeout(() => send("", { name: "return" }), 3200);          // start capture: name
     "myprov".split("").forEach((c, i) => setTimeout(() => send(c), 3300 + i * 60));   // name
     setTimeout(() => send("", { name: "return" }), 4200);          // -> baseURL step
     "http://127.0.0.1:7077/v1".split("").forEach((c, i) => setTimeout(() => send(c), 4400 + i * 40)); // baseURL
@@ -2125,6 +2204,19 @@ async function main() {
     setTimeout(() => send("", { name: "down" }), 10600);           // mock-beta in the models popup
     setTimeout(() => send("", { name: "return" }), 10800);         // save + activate
     setTimeout(() => process.exit(0), 12800);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "10") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // paste-key one-step flow: provider popup -> paste key (hidden input) -> vendor detected -> saved whatever the live fetch says
+    setTimeout(() => { "/provider".split("").forEach((c) => send(c)); }, 2200);
+    setTimeout(() => send("", { name: "return" }), 2600);          // provider popup
+    setTimeout(() => send("", { name: "down" }), 2900);            // hover the paste-key entry (1 provider above)
+    setTimeout(() => send("", { name: "return" }), 3100);          // hidden capture opens
+    "oc_sk_test-key-0000-sk".split("").forEach((c, i) => setTimeout(() => send(c), 3400 + i * 40));  // the key
+    setTimeout(() => send("", { name: "return" }), 6200);          // connect attempt against the real vendor base
+    setTimeout(() => process.exit(0), 14500);
     return;
   }
   if (process.env.HYDRA_TEST === "8") {
