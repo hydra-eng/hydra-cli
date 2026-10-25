@@ -7,7 +7,7 @@
 
 # ⬢ hydra-cli
 
-[![version](https://img.shields.io/badge/version-2.9.2-dc143c?style=flat-square)]()
+[![version](https://img.shields.io/badge/version-2.9.3-dc143c?style=flat-square)]()
 [![deps](https://img.shields.io/badge/dependencies-0-2fae62?style=flat-square)]()
 [![node](https://img.shields.io/badge/node-%E2%89%A520-2fae62?style=flat-square)]()
 [![license](https://img.shields.io/badge/license-MIT-8a8a8a?style=flat-square)](LICENSE)
@@ -30,6 +30,7 @@
 - **session forking** — `/fork 30` branches a long conversation up to a chosen turn into a brand-new session, like `git branch` for chat.
 - **palettes on the fly** — `/theme` swaps the whole UI between five hand-tuned palettes, instantly and persistently.
 - **paste a key, done** — `/key <paste>` (or `➕ paste api key` in the provider popup) detects the vendor from the key's shape — zen, OpenAI, OpenRouter, Groq, Gemini, Hugging Face, NVIDIA — connects, lists models, auto-picks one. No baseURL questions. Ever.
+- **one-step connect** — model ids are saved clean (quotes stripped), and a bad model id tells you exactly how to fix it instead of failing silently.
 - **bring any OpenAI-compatible endpoint** — `/provider` → `➕ other (custom API)` still walks through name → baseURL → key (masked) → live `/models` fetch → pick when you want full control.
 - **terminal polish** — hand-drawn banner splash, double-width-safe wraps, frozen viewport while you scroll (new logs never yank your view), mouse wheel + click + drag-select, clipboard paste.
 
@@ -129,6 +130,10 @@ sequenceDiagram
 | queue a switch mid-reply | `/sessions` works **while a turn is running** — it switches automatically after the reply |
 | `/model <n\|name>` | switch model — the list **always refreshes for the active provider**, so `qwen` and cloud models never get tangled |
 | `/provider use <name>` | flip back to a previous provider (e.g. `/provider use ollama`) |
+| `/undo` | remove the last exchange (user + reply) from the session |
+| `/regen` | re-run the last user message - a failed turn keeps the question, so you can retry |
+| `/web <url>` | fetch a page, strip it to text, inject into context - persisted with the next turn |
+| `/stats` | turn counts, approx tokens, session file, cwd, model, palette |
 | paste / copy | `ctrl+v` · drag-select ships straight to the clipboard |
 | markdown export | `/export file.md` |
 | shell | `! <command>` |

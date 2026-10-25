@@ -10,7 +10,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { spawnSync } from "node:child_process";
 
-const VERSION = "2.9.2";
+const VERSION = "2.9.3";
 const ESC = String.fromCharCode(27);
 let CRIMSON = ESC + "[91m";
 let CRIMSONBG = ESC + "[0;48;2;220;20;60m";
@@ -353,6 +353,7 @@ function providerUseLines(name) {
   return [` provider -> ${cc(CRIMSON + BOLD, name)} ${cc(DIM, activeProvider().model)}`];
 }
 function providerAddLines(name, baseURL, apiKey, model) {
+  model = String(model || "").trim().replace(/^["']+|["']+$/g, "");
   if (!name || !baseURL || !model) return [cc("\u001b[31m", " usage: /provider add <name> <baseURL> <apiKey> <model>")];
   CFG.providers[name] = { name, baseURL, apiKey: apiKey || "", model, keepAlive: "" };
   CFG.active = name; saveCfg();
@@ -433,7 +434,7 @@ async function modelListLines() {
 }
 
 async function modelUseLines(arg) {
-  arg = String(arg || "").trim();
+  arg = String(arg || "").trim().replace(/^["']+|["']+$/g, "");
   if (!arg) return [cc(DIM, " usage: /model <number> or /model <partial name>")];
   loadCfg();
   try { await fetchModels(); }
@@ -461,6 +462,10 @@ const COMMANDS = [
   { name: "/model", desc: "switch model", hint: " [n|name]" },
   { name: "/provider", desc: "switch provider \u00b7 paste key = one step", hint: "[name]" },
   { name: "/key", desc: "paste api key \u2014 auto-detects vendor, connects", hint: " <key>" },
+  { name: "/regen", desc: "regenerate the last reply from scratch", hint: "" },
+  { name: "/undo", desc: "remove the last exchange from the session", hint: "" },
+  { name: "/web", desc: "fetch a page and put it into context", hint: " <url>" },
+  { name: "/stats", desc: "turns, tokens, session + model info", hint: "" },
   { name: "/sessions", desc: "session picker dialog", hint: "" },
   { name: "/export", desc: "export the active chat as markdown", hint: "[file]" },
   { name: "/rename", desc: "rename the active session", hint: "<title>" },
@@ -499,6 +504,9 @@ function helpLines() {
     cc(DIM, " /search <words>      scan all sessions, open hits in the browser dialog"),
     cc(DIM, " /fork <turn>         branch the chat up to that turn into a new session"),
     cc(DIM, " /theme [name]        live palette swap \u00b7 crimson gold matrix ice mono"),
+    cc(DIM, " /regen               regenerate the last reply \u00b7 /undo removes the last exchange"),
+    cc(DIM, " /web <url>           fetch a web page into the conversation context"),
+    cc(DIM, " /stats               turns \u00b7 approx tokens \u00b7 session/model/provider info"),
     cc(DIM, " /copylast            copy last reply to clipboard"),
     cc(DIM, " /skills              inject a skill into context"),
     cc(DIM, " /mcp                 list configured mcp servers"),
@@ -773,6 +781,66 @@ function injectSkillValue(v) {
     addLog(cc(DIM, " skill \u201c" + s.name + "\u201d injected into context"));
   } catch { addLog(cc(DIM, " skill \u201c" + s.name + "\u201d has no SKILL.md \u00b7 skipped")); }
   scheduleDraw(true);
+}
+
+// ---- turn surgery + extras ( /undo /regen /web /stats )
+function undoTurn() {
+  if (UI.busy) { addLog(cc(DIM, " wait for the turn to finish (or hit esc) \u00b7 then /undo")); return; }
+  if (!HISTORY.length) { addLog(cc(DIM, " nothing to undo \u00b7 the session has no turns")); return; }
+  const before = HISTORY.length;
+  while (HISTORY.length && HISTORY[HISTORY.length - 1].role !== "user") HISTORY.pop();
+  if (HISTORY.length) HISTORY.pop();
+  const n = before - HISTORY.length;
+  if (!n) { addLog(cc(DIM, " nothing to undo")); return; }
+  saveSession();
+  addLog(cc(DIM, " \u21a9 removed the last exchange (" + n + " messages) \u00b7 /regen retries it"));
+  scheduleDraw(true);
+}
+async function regenLast() {
+  if (UI.busy) { addLog(cc(DIM, " wait for the turn to finish (or hit esc) \u00b7 then /regen")); return; }
+  if (!HISTORY.length) { addLog(cc(DIM, " nothing to regen \u00b7 the session is empty")); return; }
+  const lu = [...HISTORY].reverse().find((m) => m.role === "user" && !String(m.content || "").startsWith("[skill"));
+  if (!lu) { addLog(cc(DIM, " no user turn to regen")); return; }
+  const q = String(lu.content || "");
+  while (HISTORY.length && HISTORY[HISTORY.length - 1].role !== "user") HISTORY.pop();
+  if (HISTORY.length) HISTORY.pop();
+  addLog(cc(CRIMSON + BOLD, " \u21ba regen \u2193"));
+  await runAgentTurn(q);
+}
+async function webInjectLines(url) {
+  url = String(url || "").trim();
+  if (!/^https?:\/\//i.test(url)) return [cc(DIM, " usage: /web <https url>")];
+  startBusy("fetching page");
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(15000), headers: { "User-Agent": "Mozilla/5.0 hydra-cli" } });
+    let t = await r.text();
+    if (!r.ok) return [cc("\u001b[31m", " http " + r.status + " for " + url)];
+    t = t.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ").replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">").replace(/&quot;/gi, '"').replace(/&#0?39;/gi, "'").replace(/\s+/g, " ").trim();
+    if (!t) return [cc("\u001b[31m", " no readable text at " + url)];
+    const body = t.slice(0, 6000);
+    HISTORY.push({ role: "user", content: "[web: " + url + "]\n" + body });
+    return [" \ud83c\udf10 fetched " + cc(CRIMSON + BOLD, truncateLine(url, 42)) + cc(DIM, " \u00b7 " + body.length + " chars into context \u00b7 persisted next turn")];
+  } catch (e) {
+    return [cc("\u001b[31m", " fetch failed: " + (e.message || e))];
+  } finally {
+    stopBusy();
+  }
+}
+function statsLines() {
+  loadCfg();
+  const users = HISTORY.filter((m) => m.role === "user" && !String(m.content || "").startsWith("[skill")).length;
+  const asst = HISTORY.filter((m) => m.role === "assistant").length;
+  const chars = HISTORY.reduce((a, m) => a + String(m.content || "").length, 0);
+  const p = activeProvider();
+  return [
+    cc(CRIMSON + BOLD, " \u2500\u2500 session stats"),
+    cc(DIM, " turns: ") + cc(CRIMSON + BOLD, "" + users) + cc(DIM, " \u00b7 user msg: " + users + " \u00b7 replies: " + asst + " \u00b7 in history: " + HISTORY.length),
+    cc(DIM, " approx tokens: ") + cc(CRIMSON + BOLD, "~" + Math.round(chars / 4)) + cc(DIM, " (" + chars + " chars)"),
+    cc(DIM, " session: ") + (ACTIVE_SESSION_FILE || cc(DIM, "not saved yet")) + cc(DIM, " \u00b7 cwd: " + shortPath(CWD)),
+    cc(DIM, " model: ") + cc(CRIMSON + BOLD, p.model) + cc(DIM, " \u00b7 provider: " + p.name + " \u00b7 palette: " + activeTheme() + " \u00b7 mode: " + UI.mode),
+  ];
 }
 function popupActivate() {
   const t = UI.popupTitle, it = UI.popupItems[UI.popupSel];
@@ -1434,6 +1502,13 @@ async function submitLine() {
     try { addLogLines(await keyPasteLines(arg)); } catch (e) { addLog(cc("\u001b[31m", " error: " + (e.message || e))); }
     scheduleDraw(true); return;
   }
+  if (q === "/undo") { undoTurn(); return; }
+  if (q === "/regen") { await regenLast(); return; }
+  if (q === "/stats") { addLogLines(statsLines()); return; }
+  if (q.startsWith("/web")) {
+    try { addLogLines(await webInjectLines(q.replace("/web", "").trim())); } catch (e) { addLog(cc("\u001b[31m", " error: " + (e.message || e))); }
+    scheduleDraw(true); return;
+  }
   if (q.startsWith("/cd")) {
     const arg = q.replace("/cd", "").trim();
     try {
@@ -1650,6 +1725,8 @@ async function runAgentTurn(q) {
     const timedOut = e.name === "TimeoutError" || /timed out|aborted due to timeout/.test(e.message || "");
     const msg = e.name === "AbortError" ? "interrupted" : timedOut ? "model timed out after " + Math.round(MODEL_TIMEOUT / 1000) + "s \u00b7 provider \u201c" + provider.name + "\u201d not responding \u00b7 esc interrupts too \u00b7 HYDRA_MODEL_TIMEOUT tunes this" : (e.message || String(e));
     addLog(cc(e.name === "AbortError" ? DIM : timedOut ? "\u001b[33m" : "\u001b[31m", " " + msg));
+    if (/model.*not.*found|invalid model|model_id|http 404\b/i.test(e.message || "")) addLog(cc(DIM, " the provider didn't take that model id \u00b7 /model opens the live list for this provider \u00b7 /provider use <name> flips back"));
+    if (HISTORY[HISTORY.length - 1]?.content !== q) HISTORY.push({ role: "user", content: q });
   }
   stopBusy();
   ABORT = null;
@@ -1840,7 +1917,7 @@ function onKey(str, key) {
         const pk = popupKind();
         // read-only commands are allowed while a turn runs (sessions browsing must never be blocked)
         if (UI.popupOpen && pk !== "slash" && pk !== "custom" && pk !== "model" && pk !== "provider") { popupActivate(); return; }
-        if ((UI.popupOpen && !cmd) || /^(\/(sessions|resume|help|mcp|mcps?|copylast|cd|export|rename|provider|model|fork|search|theme)\b)/.test(cmd)) {
+        if ((UI.popupOpen && !cmd) || /^(\/(sessions|resume|help|mcp|mcps?|copylast|cd|export|rename|provider|model|fork|search|theme|key|undo|regen|web|stats)\b)/.test(cmd)) {
           submitLine().catch((e) => { addLog(cc("\u001b[31m", " " + (e.message || e))); scheduleDraw(); });
           return;
         }
@@ -2299,6 +2376,31 @@ async function main() {
     setTimeout(() => { "/model delta".split("").forEach((c) => send(c)); }, 9000);
     setTimeout(() => send("", { name: "return" }), 9400);          // fresh list shows gamma/delta -> switch to delta
     setTimeout(() => process.exit(0), 12500);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "12") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // turn surgery + extras: /stats / /undo / /web (mock html) / /regen (dead provider -> timeout) + quoted model-id hardening
+    const httpm = await import("node:http");
+    const srv = httpm.createServer((req, res) => {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end("<html><head><title>k-page</title></head><body><p>hydra-web-corpus-marker</p><script>void 0</script></body></html>");
+    });
+    await new Promise((ok) => srv.listen(7079, "127.0.0.1", ok));
+    srv.unref?.();
+    loadCfg();
+    setTimeout(() => { "/resume".split("").forEach((c) => send(c)); }, 2200);
+    setTimeout(() => send("", { name: "return" }), 2600);          // open the seeded deep-dive session
+    setTimeout(() => { "/stats".split("").forEach((c) => send(c)); }, 3400);
+    setTimeout(() => send("", { name: "return" }), 3800);          // turns > 0, approx tokens
+    setTimeout(() => { "/undo".split("").forEach((c) => send(c)); }, 5600);
+    setTimeout(() => send("", { name: "return" }), 6000);          // drops the last exchange
+    setTimeout(() => { "/web http://127.0.0.1:7079".split("").forEach((c) => send(c)); }, 7600);
+    setTimeout(() => send("", { name: "return" }), 8000);          // fetch page -> inject into context
+    setTimeout(() => { "/regen".split("").forEach((c) => send(c)); }, 10000);
+    setTimeout(() => send("", { name: "return" }), 10400);         // re-runs the last user msg -> dead provider -> timeout
+    setTimeout(() => process.exit(0), 22500);
     return;
   }
   if (process.env.HYDRA_TEST) {
