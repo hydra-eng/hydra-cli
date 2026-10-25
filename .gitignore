@@ -1,0 +1,4 @@
+node_modules/
+tmp-home/
+*.log
+.config/
