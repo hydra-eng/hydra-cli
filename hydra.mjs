@@ -10,7 +10,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
 
-const VERSION = "2.9.4";
+const VERSION = "2.9.5";
 const ESC = String.fromCharCode(27);
 let CRIMSON = ESC + "[91m";
 let CRIMSONBG = ESC + "[0;48;2;220;20;60m";
@@ -884,6 +884,16 @@ function popupActivate() {
   if (t === "slash") { setUserInput((it.value || stripAnsi(it.label)).trim() + " "); syncSlashPopup(); return; }
 }
 const TRASH_DIR = () => path.join(sessionsDir(), ".trash");
+function stashReplace(oldFile) {
+  const oldPath = path.join(sessionsDir(), String(oldFile));
+  try {
+    if (!fs.existsSync(oldPath)) return;
+    fs.mkdirSync(TRASH_DIR(), { recursive: true });
+    const stash = String(Date.now()).padStart(13, "0") + "-" + String(oldFile);
+    try { fs.renameSync(oldPath, path.join(TRASH_DIR(), stash)); }
+    catch { fs.copyFileSync(oldPath, path.join(TRASH_DIR(), stash)); fs.unlinkSync(oldPath); }
+  } catch { try { fs.unlinkSync(oldPath); } catch { /* last resort */ } }
+}
 function trashLast() {
   try {
     const t = TRASH_DIR();
@@ -963,7 +973,7 @@ function commitRenameDialog() {
     const ts = (/^([0-9]{4}-[0-9]{2}-[0-9]{2}T[\d-]+Z)/.exec(String(it.value)) || [])[1] || "";
     const newPath = ts ? ts + "-" + kebab + ".json" : String(it.value);
     fs.writeFileSync(path.join(sessionsDir(), newPath), JSON.stringify(j, null, 2));
-    if (newPath !== String(it.value)) { try { fs.unlinkSync(oldPath); } catch { /* nop */ } }
+    if (newPath !== String(it.value)) stashReplace(it.value);   // pre-rename copy lands in .trash
     if (wasActive) { ACTIVE_SESSION_FILE = newPath; CURRENT_SESSION_TITLE = nm; }
   } catch (e) { addLog(cc("\u001b[31m", " rename failed: " + (e.message || e))); }
   SESSIONS_DIRTY = true;
@@ -1058,8 +1068,7 @@ function saveSession() {
       history: HISTORY,
     }, null, 2));
     if (ACTIVE_SESSION_FILE && ACTIVE_SESSION_FILE !== file) {
-      const old = path.join(sessionsDir(), ACTIVE_SESSION_FILE);
-      try { fs.unlinkSync(old); } catch { /* nop */ }
+      stashReplace(ACTIVE_SESSION_FILE);   // superseded file keeps a restorable copy instead of deleting it
     }
     ACTIVE_SESSION_FILE = file;
     SESSIONS_DIRTY = true;
@@ -1713,7 +1722,7 @@ async function submitLine() {
       const ts = (/^([0-9]{4}-[0-9]{2}-[0-9]{2}T[\d-]+Z)/.exec(String(ACTIVE_SESSION_FILE)) || [])[1] || "";
       const newPath = ts ? ts + "-" + kebab + ".json" : String(ACTIVE_SESSION_FILE);
       fs.writeFileSync(path.join(sessionsDir(), newPath), JSON.stringify(j, null, 2));
-      if (newPath !== String(ACTIVE_SESSION_FILE)) { try { fs.unlinkSync(oldPath); } catch { /* nop */ } }
+      if (newPath !== String(ACTIVE_SESSION_FILE)) stashReplace(ACTIVE_SESSION_FILE);   // pre-rename copy lands in .trash
       ACTIVE_SESSION_FILE = newPath; CURRENT_SESSION_TITLE = nm;
       SESSIONS_DIRTY = true;
       addLog(cc(CRIMSON + BOLD, " renamed to \u201c" + nm + "\u201d"));
