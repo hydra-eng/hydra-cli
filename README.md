@@ -7,7 +7,7 @@
 
 # ⬢ hydra-cli
 
-[![version](https://img.shields.io/badge/version-2.9.3-dc143c?style=flat-square)]()
+[![version](https://img.shields.io/badge/version-2.9.4-dc143c?style=flat-square)]()
 [![deps](https://img.shields.io/badge/dependencies-0-2fae62?style=flat-square)]()
 [![node](https://img.shields.io/badge/node-%E2%89%A520-2fae62?style=flat-square)]()
 [![license](https://img.shields.io/badge/license-MIT-8a8a8a?style=flat-square)](LICENSE)
@@ -148,7 +148,7 @@ sequenceDiagram
 /model                 live model list for the active provider
 ```
 
-`HYDRA_MODEL_TIMEOUT` (ms, default 180000) guards hung endpoints; `HYDRA_NO_PS=1` falls back to `cmd.exe` for `!` and the `bash` tool.
+`HYDRA_MODEL_TIMEOUT` (ms, default 180000) guards hung endpoints; `HYDRA_TOOL_TIMEOUT` (ms, default 300000) kills long-running `bash` tool calls — the UI stays live during every tool, esc interrupts immediately, and the session is saved between tool steps. `HYDRA_NO_PS=1` falls back to `cmd.exe` for `!` only.
 
 ## 🗂 sessions
 

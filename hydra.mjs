@@ -8,9 +8,9 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
-const VERSION = "2.9.3";
+const VERSION = "2.9.4";
 const ESC = String.fromCharCode(27);
 let CRIMSON = ESC + "[91m";
 let CRIMSONBG = ESC + "[0;48;2;220;20;60m";
@@ -120,17 +120,14 @@ function activeProvider() {
 const SKIP_DIRS = ["node_modules", ".git", "dist", "build", "target", ".venv", "__pycache__", ".next"];
 let CWD = process.cwd();
 
-function runToolCall(tc) {
+async function runToolCall(tc, signal) {
   let args = {};
   try { args = JSON.parse(tc.function?.arguments || "{}"); } catch { args = {}; }
   const label = `${tc.function?.name || "?"} ${JSON.stringify(args).slice(0, 90)}`;
   let result = "";
   try {
     if (tc.function?.name === "bash") {
-      const sh = process.env.SystemRoot ? process.env.SystemRoot + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" : "powershell.exe";
-      const r = spawnSync(sh,
-        ["-NoProfile", "-NoLogo", "-ExecutionPolicy", "Bypass", "-Command", String(args.command || "")],
-        { cwd: CWD, timeout: 120000, maxBuffer: 1024 * 1024 * 4, encoding: "utf8", windowsHide: true });
+      const r = await runShellAsync(String(args.command || ""), CWD, TOOL_TIMEOUT, signal);
       result = ((r.stdout || "") + (r.stderr ? "\n[stderr] " + r.stderr : "")).trim();
       if (r.status) result += `[exit ${r.status}]`;
     } else if (tc.function?.name === "read") {
@@ -214,6 +211,35 @@ const TOOLS_SCHEMA = [
 // (tune with env HYDRA_MODEL_TIMEOUT, milliseconds)
 const MODEL_TIMEOUT = Math.max(5000, Number(process.env.HYDRA_MODEL_TIMEOUT) || 180000);
 const withTimeout = (signal, ms) => AbortSignal.any([signal, AbortSignal.timeout(ms)].filter(Boolean));
+const TOOL_TIMEOUT = Math.max(15000, Number(process.env.HYDRA_TOOL_TIMEOUT) || 300000);
+
+function runShellAsync(command, cwd, timeoutMs, signal) {
+  return new Promise((resolve) => {
+    let done = false, out = "", err = "", ch = null;
+    const finish = (status, extra) => {
+      if (done) return; done = true;
+      try { clearTimeout(t); } catch { /* nop */ }
+      try { if (signal) signal.removeEventListener("abort", killChild); } catch { /* nop */ }
+      resolve({ status, stdout: out, stderr: err + (extra || "") });
+    };
+      const t = setTimeout(() => {
+      try { ch.kill(); } catch { /* nop */ }
+      finish(null, `\n[stopped after ${Math.round(timeoutMs / 1000)}s \u00b7 HYDRA_TOOL_TIMEOUT tunes this \u00b7 esc interrupts too]`);
+    }, timeoutMs);
+    const killChild = () => { try { ch.kill(); } catch { /* nop */ } finish(null, "\n[interrupted by esc]"); };
+    if (signal) { try { signal.addEventListener("abort", killChild, { once: true }); } catch { /* nop */ } }
+    try {
+      const sh = process.env.SystemRoot ? process.env.SystemRoot + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" : "powershell.exe";
+      ch = spawn(sh, ["-NoProfile", "-NoLogo", "-ExecutionPolicy", "Bypass", "-Command", String(command || "")],
+        { cwd, windowsHide: true });
+    } catch (e) { finish(null, String(e.message || e)); return; }
+    ch.stdout?.on("data", (d) => { out += d; });
+    ch.stderr?.on("data", (d) => { err += d; });
+    ch.on("error", (e) => finish(null, String(e.message || e)));
+    ch.on("close", (code, sig) => finish(code, sig && !done ? `\n[terminated ${sig}]` : ""));
+  });
+}
+
 
 async function chatOnce(messages, provider, ondelta, signal, noTools) {
   const body = { model: provider.model, messages, stream: true, tools: noTools ? undefined : TOOLS_SCHEMA, temperature: 0.2 };
@@ -309,8 +335,10 @@ async function agentLoop(question, provider, ondelta, onTool, history, signal, n
     for (const tc of out.tool_calls) {
       TOOL_CALLS_TOTAL++;
       if (onTool) onTool(runToolLabel(tc));
-      const callRes = runToolCall(tc);
+      const callRes = await runToolCall(tc, signal);
       messages.push({ role: "tool", tool_call_id: tc.id, content: callRes.result });
+      try { saveSession(); } catch { /* durability between tool steps */ }
+      if (signal?.aborted) return finalText;
     }
   }
   return finalText;
@@ -322,14 +350,14 @@ async function agentLoop(question, provider, ondelta, onTool, history, signal, n
 // ------------------------------------------------------------
 let lastModels = [];
 
-async function fetchModels() {
+async function fetchModels(timeoutMs) {
   const p = activeProvider();
-  return fetchModelsFor(p.baseURL, p.apiKey);
+  return fetchModelsFor(p.baseURL, p.apiKey, timeoutMs);
 }
-async function fetchModelsFor(baseURL, apiKey) {
+async function fetchModelsFor(baseURL, apiKey, timeoutMs) {
   const headers = {};
   if (apiKey) headers.Authorization = "Bearer " + apiKey;
-  const r = await fetch(String(baseURL).replace(/\/$/, "") + "/models", { headers, signal: AbortSignal.timeout(15000) });
+  const r = await fetch(String(baseURL).replace(/\/$/, "") + "/models", { headers, signal: AbortSignal.timeout(timeoutMs || 15000) });
   const j = await r.json();
   if (j.error) throw new Error(j.error.message || j.error);
   lastModels = (j.data || j.models || []).map((m) => String(m.id || m.name || m).replace(/^models\//, "")).filter(Boolean).sort();
@@ -380,6 +408,7 @@ const KEY_VENDORS = [
   [/^AQ\./, { name: "gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai" }],
   [/^hf_/, { name: "huggingface", baseURL: "https://router.huggingface.co/v1" }],
   [/^nvapi-/, { name: "nvidia", baseURL: "https://integrate.api.nvidia.com/v1" }],
+  [/^xpl_/, { name: "explabs", baseURL: "https://api.experientiallabs.ai/v1" }],
 ];
 function detectVendor(key) {
   for (const [rx, v] of KEY_VENDORS) if (rx.test(key)) return { name: v.name, baseURL: v.baseURL };
@@ -393,18 +422,18 @@ function keySaveLines(v, key, model) {
 async function keyPasteLines(key) {
   if (!key) return [cc(DIM, " paste a key first \u00b7 /key <your-key>")];
   const v = detectVendor(key);
-  startBusy("connecting " + v.name);
+  const hadBusy = UI.busy; if (!hadBusy) startBusy("connecting " + v.name);
   let models = [];
   try { models = await fetchModelsFor(v.baseURL, key); }
   catch (e) {
-    stopBusy();
+    if (!hadBusy) stopBusy();
     keySaveLines(v, key, "");
     return [
       cc("\u001b[31m", " couldn't verify " + v.baseURL + " (" + (e.message || e) + ") \u2014 key saved, will retry live on your first turn"),
       cc(DIM, " wrong host for this key? override: /provider add <name> <baseURL> <key> <model> \u00b7 /model to pick"),
     ];
   }
-  stopBusy();
+  if (!hadBusy) stopBusy();
   if (!models.length) {
     keySaveLines(v, key, "");
     return [
@@ -423,7 +452,7 @@ async function keyPasteLines(key) {
 async function modelListLines() {
   loadCfg();
   const p = activeProvider();
-  try { await fetchModels(); } catch { lastModels = []; }
+  try { await fetchModels(6000); } catch { lastModels = []; }
   const lines = [` Models on ${cc(CRIMSON + BOLD, p.name)}: ${cc(DIM, p.baseURL)}`, ""];
   lastModels.forEach((m, i) => {
     const active = m === p.model;
@@ -437,7 +466,7 @@ async function modelUseLines(arg) {
   arg = String(arg || "").trim().replace(/^["']+|["']+$/g, "");
   if (!arg) return [cc(DIM, " usage: /model <number> or /model <partial name>")];
   loadCfg();
-  try { await fetchModels(); }
+  try { await fetchModels(6000); }
   catch (e) {
     if (arg.includes("/")) {
       CFG.providers[CFG.active].model = arg; saveCfg();
@@ -843,14 +872,15 @@ function statsLines() {
   ];
 }
 function popupActivate() {
-  const t = UI.popupTitle, it = UI.popupItems[UI.popupSel];
+  if (!UI.popupOpen) return;
+  const t = UI.popupTitle, it = UI.popupItems[UI.popupSel], kind = popupKind();
   closePopup(); setUserInput("");
   if (!it) return;
-  if (popupKind() === "model") { startBusy("switching model"); ((async () => { try { addLogLines(await modelUseLines(String(Number(it.value) + 1))); } catch (e) { addLog(cc("\u001b[31m", " error: " + (e.message || e))); } stopBusy(); })()); return; }
-  if (popupKind() === "provider") { if (it.value === "pastekey") { startPasteKeyCapture(); return; } if (it.value === "other") { startCustomProvider(); return; } addLogLines(providerUseLines(it.value)); return; }
-  if (popupKind() === "custom") { providerPickModels(); return; }
-  if (popupKind() === "skills") { injectSkillValue(it.value); return; }
-  if (popupKind() === "theme") { applyTheme(String(it.value)); addLog(cc(CRIMSON + BOLD, "  palette -> " + it.value + " \u00b7 applies instantly, saved to config")); scheduleDraw(true); return; }
+  if (kind === "model") { const hadBusy = UI.busy; if (!hadBusy) startBusy("switching model"); ((async () => { try { addLogLines(await modelUseLines(String(Number(it.value) + 1))); } catch (e) { addLog(cc("\u001b[31m", " error: " + (e.message || e))); } if (!hadBusy) stopBusy(); })()); return; }
+  if (kind === "provider") { if (it.value === "pastekey") { startPasteKeyCapture(); return; } if (it.value === "other") { startCustomProvider(); return; } addLogLines(providerUseLines(it.value)); return; }
+  if (kind === "custom") { providerPickModels(); return; }
+  if (kind === "skills") { injectSkillValue(it.value); return; }
+  if (kind === "theme") { applyTheme(String(it.value)); addLog(cc(CRIMSON + BOLD, "  palette -> " + it.value + " \u00b7 applies instantly, saved to config")); scheduleDraw(true); return; }
   if (t === "slash") { setUserInput((it.value || stripAnsi(it.label)).trim() + " "); syncSlashPopup(); return; }
 }
 const TRASH_DIR = () => path.join(sessionsDir(), ".trash");
@@ -1308,7 +1338,7 @@ function popupKind() {
   const t = stripAnsi(UI.popupTitle || "");
   return t.startsWith("custom models") ? "custom" : t.split(" ")[0];
 }
-function closePopup() { UI.popupOpen = false; UI.popupItems = []; UI.popupSel = 0; scheduleDraw(); }
+function closePopup() { UI.popupOpen = false; UI.popupTitle = ""; UI.popupItems = []; UI.popupSel = 0; scheduleDraw(); }
 
 function syncSlashPopup() {
   const q = UI.input;
@@ -1328,12 +1358,25 @@ function syncSlashPopup() {
 async function openModelPopup() {
   closePopup();
   setUserInput("");
-  startBusy("fetching models");
-  try { await fetchModels(); }
-  catch (e) { stopBusy(); addLog(cc("\u001b[31m", " model fetch failed: " + e.message)); return; }
-  stopBusy();
   const p = activeProvider();
-  openPopup("model \u2502 /model <n|name>", lastModels.map((m, i) => ({ label: m, desc: m === p.model ? " active" : "", value: i })));
+  openPopup("model \u2502 /model <n|name>",
+    lastModels.map((m, i) => ({ label: m, desc: m === p.model ? " active" : "", value: i })));
+  const hadBusy = UI.busy;   // a running turn owns the busy spinner - a model list refresh must never steal or clear it
+  try {
+    const before = lastModels.slice();
+    await fetchModels(6000);
+    if (UI.popupOpen && String(UI.popupTitle || "").startsWith("model")) {
+      if (lastModels.join("\u0000") !== before.join("\u0000")) {
+        const p2 = activeProvider();
+        UI.popupItems = lastModels.map((m, i) => ({ label: m, desc: m === p2.model ? " active" : "", value: i }));
+        UI.popupSel = 0; scheduleDraw();
+      }
+    } else {
+      if (lastModels.join("\u0000") !== before.join("\u0000") && !hadBusy) scheduleDraw();
+    }
+  } catch (e) {
+    if (!hadBusy) { addLog(cc("\u001b[31m", " model fetch failed: " + (e.message || e))); scheduleDraw(); }
+  }
 }
 async function openProviderPopup() {
   closePopup();
@@ -1451,14 +1494,14 @@ async function submitLine() {
     return;
   }
   if (!q && UI.input.trim()) q = UI.input.trim();
-    if (popupKind() === "custom") { providerPickModels(); return; }
-  if (popupKind() === "model") {
+    if (UI.popupOpen && popupKind() === "custom") { providerPickModels(); return; }
+  if (UI.popupOpen && popupKind() === "model") {
     const it = UI.popupItems[UI.popupSel];
     closePopup(); setUserInput("");
     if (it) { startBusy("switching model"); try { addLogLines(await modelUseLines(String(it.value + 1))); } catch (e) { addLog(cc("\u001b[31m", " error: " + e.message)); } stopBusy(); }
     return;
   }
-  if (popupKind() === "provider") {
+  if (UI.popupOpen && popupKind() === "provider") {
     const it = UI.popupItems[UI.popupSel];
     closePopup(); setUserInput("");
     if (it && it.value === "pastekey") { startPasteKeyCapture(); return; }
@@ -1466,16 +1509,16 @@ async function submitLine() {
     if (it) addLogLines(providerUseLines(it.value));
     return;
   }
-  if (popupKind() === "skills") {
+  if (UI.popupOpen && popupKind() === "skills") {
     const it = UI.popupItems[UI.popupSel];
     closePopup(); setUserInput("");
     if (it) injectSkillValue(it.value);
     return;
   }
   if (UI.popupOpen && UI.popupTitle === "slash") {
-    const it = UI.popupItems[UI.popupSel];
-    if (it && stripAnsi(it.value) === stripAnsi(q)) { closePopup(); } // exact command -> fall through and execute
-    else if (it && stripAnsi(it.label).startsWith(q)) { setUserInput((it.value || stripAnsi(it.label)).trim() + " "); return; }
+    const itq = UI.popupItems[UI.popupSel];
+    if (itq && stripAnsi(itq.value) === stripAnsi(q)) { closePopup(); } // exact command -> fall through and execute
+    else if (itq && stripAnsi(itq.label).startsWith(q)) { setUserInput((itq.value || stripAnsi(itq.label)).trim() + " "); return; }
   }
   if (!q) { closePopup(); return; }
   setUserInput("");
@@ -1682,15 +1725,10 @@ async function submitLine() {
     if (!cmd) { addLog(cc(DIM, " ! <command>  -  run a shell command, e.g. !git status")); return; }
     addLog(cc(CRIMSON + BOLD, "  ! ") + cc(DIM, clip(cmd, Math.max(30, UI.cols - PANEL_W - 6))));
     try {
-      const usePS = !process.env.HYDRA_NO_PS;
-      const sh = usePS ? (process.env.SystemRoot ? process.env.SystemRoot + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" : "powershell.exe") : (process.env.ComSpec || "cmd.exe");
-      const args = usePS ? ["-NoProfile", "-NoLogo", "-ExecutionPolicy", "Bypass", "-Command", cmd] : ["/d", "/c", cmd];
-      const r = spawnSync(sh, args,
-        { cwd: CWD, timeout: 300000, maxBuffer: 1024 * 1024 * 4, encoding: "utf8", windowsHide: true });
+      const r = await runShellAsync(cmd, CWD, 600000);
       const outl = ((r.stdout || "") + (r.stderr ? "\n[stderr] " + r.stderr : "")).trim().split(/\r?\n/);
       for (const l of outl.slice(-40)) addLog(cc(DIM, "  " + l));
-      if (r.error) addLog(cc("\u001b[31m", "  " + r.error.message));
-      else if (r.status) addLog(cc("\u001b[31m", "  exit " + r.status));
+      if (r.status) addLog(cc("\u001b[31m", "  exit " + r.status));
     } catch (e) { addLog(cc("\u001b[31m", " " + (e.message || e))); }
     return;
   }
@@ -2401,6 +2439,83 @@ async function main() {
     setTimeout(() => { "/regen".split("").forEach((c) => send(c)); }, 10000);
     setTimeout(() => send("", { name: "return" }), 10400);         // re-runs the last user msg -> dead provider -> timeout
     setTimeout(() => process.exit(0), 22500);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "13") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // freeze regression: switching provider + model must NEVER deadlock sending in the same chat
+    const httpm = await import("node:http");
+    const srv = httpm.createServer((req, res) => {
+      const auth = req.headers.authorization || "";
+      if (req.method === "POST" && String(req.url).includes("chat/completions")) {
+        res.writeHead(200, { "Content-Type": "text/event-stream" });
+        res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "PONG from mock" } }] }) + "\n\n");
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
+      else if (auth === "Bearer key-a") res.end(JSON.stringify({ data: [{ id: "alpha-a" }, { id: "beta-b" }] }));
+      else res.end(JSON.stringify({ data: [] }));
+    });
+    await new Promise((ok) => srv.listen(7081, "127.0.0.1", ok));
+    srv.unref?.();
+    loadCfg();
+    CFG.providers["prov-live"] = { name: "prov-live", baseURL: "http://127.0.0.1:7081/v1", apiKey: "key-a", model: "alpha-a" };
+    CFG.providers["prov-dead"] = { name: "prov-dead", baseURL: "http://192.0.2.1:11434/v1", apiKey: "", model: "" };
+    CFG.active = "prov-live";
+    saveCfg();
+    setTimeout(() => { "one".split("").forEach((c) => send(c)); }, 1400);
+    setTimeout(() => send("", { name: "return" }), 1800);
+    setTimeout(() => { "/model".split("").forEach((c) => send(c)); }, 3200);
+    setTimeout(() => send("", { name: "return" }), 3600);          // popup opens instantly (no blocking fetch)
+    setTimeout(() => send("", { name: "down" }), 4000);
+    setTimeout(() => send("", { name: "return" }), 4400);          // model -> beta-b
+    setTimeout(() => { "/provider use prov-dead".split("").forEach((c) => send(c)); }, 5400);
+    setTimeout(() => send("", { name: "return" }), 5800);          // provider -> prov-dead (unreachable)
+    setTimeout(() => { "/model".split("").forEach((c) => send(c)); }, 7200);
+    setTimeout(() => send("", { name: "return" }), 7600);          // popup still opens instantly on a dead provider
+    setTimeout(() => send("", { name: "escape" }), 8600);          // close it without picking
+    setTimeout(() => { "two".split("").forEach((c) => send(c)); }, 9200);
+    setTimeout(() => send("", { name: "return" }), 9600);          // send goes through -> dead turn -> 8s timeout reported
+    setTimeout(() => process.exit(0), 20500);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "14") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // bash tool must NOT block the event loop: /stats typed mid-tool must render BEFORE the final reply
+    const httpm = await import("node:http");
+    const srv = httpm.createServer((req, res) => {
+      const body = [];
+      req.on("data", (c) => body.push(c));
+      req.on("end", () => {
+        const raw = Buffer.concat(body).toString();
+        if (req.method === "POST" && String(req.url).includes("chat/completions")) {
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          if (raw.includes('"role":"tool"')) {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "PONG after tool" } }] }) + "\n\n");
+          } else {
+            res.write("data: " + JSON.stringify({
+              choices: [{ delta: { tool_calls: [{ index: 0, id: "c1", type: "function",
+                function: { name: "bash", arguments: JSON.stringify({ command: "ping -n 12 127.0.0.1" }) } }] } }],
+            }) + "\n\n");
+          }
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } else res.end(JSON.stringify({ data: [{ id: "alpha-a" }] }));
+      });
+    });
+    await new Promise((ok) => srv.listen(7082, "127.0.0.1", ok));
+    srv.unref?.();
+    loadCfg();
+    CFG.providers["prov-live"] = { name: "prov-live", baseURL: "http://127.0.0.1:7082/v1", apiKey: "key-b", model: "alpha-a" };
+    CFG.active = "prov-live";
+    saveCfg();
+    setTimeout(() => { "go".split("").forEach((c) => send(c)); }, 1200);
+    setTimeout(() => send("", { name: "return" }), 1600);          // turn: bash ping (~11s) -> replies PONG after tool
+    setTimeout(() => { "/stats".split("").forEach((c) => send(c)); }, 4200);   // typed DURING the tool call
+    setTimeout(() => send("", { name: "return" }), 4500);          // must land while the tool is still running (UI alive)
+    setTimeout(() => process.exit(0), 20000);
     return;
   }
   if (process.env.HYDRA_TEST) {
