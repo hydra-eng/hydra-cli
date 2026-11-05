@@ -1,0 +1,19 @@
+{
+  "skills": [
+    {
+      "name": "ps5-pitfalls",
+      "description": "PowerShell 5.1 traps and safe command patterns for hydra's bash tool",
+      "path": "ps5-pitfalls.md"
+    },
+    {
+      "name": "git-ship",
+      "description": "Commit, push to both remotes and verify without leaking secrets",
+      "path": "git-ship.md"
+    },
+    {
+      "name": "hydra-sweep",
+      "description": "How hydra's own regression sweep works and how to extend it",
+      "path": "hydra-sweep.md"
+    }
+  ]
+}

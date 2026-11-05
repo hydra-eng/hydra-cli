@@ -7,7 +7,7 @@
 
 # ⬢ hydra-cli
 
-[![version](https://img.shields.io/badge/version-3.0.0-dc143c?style=flat-square)]()
+[![version](https://img.shields.io/badge/version-3.1.0-dc143c?style=flat-square)]()
 [![deps](https://img.shields.io/badge/dependencies-0-2fae62?style=flat-square)]()
 [![node](https://img.shields.io/badge/node-%E2%89%A520-2fae62?style=flat-square)]()
 [![license](https://img.shields.io/badge/license-MIT-8a8a8a?style=flat-square)](LICENSE)
@@ -33,6 +33,21 @@
 - **one-step connect** — model ids are saved clean (quotes stripped), and a bad model id tells you exactly how to fix it instead of failing silently.
 - **bring any OpenAI-compatible endpoint** — `/provider` → `➕ other (custom API)` still walks through name → baseURL → key (masked) → live `/models` fetch → pick when you want full control.
 - **terminal polish** — hand-drawn banner splash, double-width-safe wraps, frozen viewport while you scroll (new logs never yank your view), mouse wheel + click + drag-select, clipboard paste.
+
+---
+
+## 🧠 hermes-grade learning loop
+
+Inspired by the Hermes Agent's design: hydra is not just a chat shell — it learns, keeps memory, writes its own skills, and gates its own dangerous commands.
+
+- **skills it writes itself** — the model can save reusable skills (`~/.hydra/skills/<name>/SKILL.md`, front matter + body) via the built-in `skill_write` tool. A skill's `description` always rides in the system prompt; the body loads on demand. Start a message with the skill's name and its guide is injected automatically — no slash command needed.
+- **memory that survives sessions** — the model saves durable facts with `memory_write` (deduped, capped) into `~/.hydra/memory.md`, always in context. Lessons from every turn (topic, tools used, outcome) append to `~/.hydra/learnings.jsonl` and the last 5 ride in the system prompt — a real self-improvement loop.
+- **`/learn <text | url | file>`** — hand hydra raw material and a distillation turn converts it into a reusable skill (never copies passages) and saves it itself.
+- **skills hub** — `/hub` opens the remote catalog (one flat `hub.json`); `enter` installs a skill after a security scan (secrets, eval-tampering patterns) into your local skills dir. Env `HYDRA_HUB_URL` / `HYDRA_HUB_BASE` point the hub anywhere.
+- **sandbox controls** — `/sandbox ask|strict|open` (default `ask`): risky commands (`rm -rf` family, `format`, reg edits, `IEX`, force-push…) ask a `y`/`n` footer prompt before running; `strict` blocks them outright. Env override `HYDRA_SANDBOX`. Auto-worked sessions (no TTY) are auto-denied.
+- **deep terminal** — short one-line `bash` tool calls run inside a persistent hidden PowerShell child, so `cd`, env vars and venv activation persist call to call like a real working terminal; everything else uses the one-shot runner. `esc` still interrupts.
+- **write-approval gate** — `/skills-safe on` makes `skill_write` require a `y` confirmation before the model can add, change or delete a skill. Removed skills go to `skills/.trash/` (as with sessions: nothing is hard-deleted).
+- `/memory` prints the remembered set; `/skills` lists installed skills with their triggers.
 
 ## 👼 palettes
 
@@ -137,6 +152,11 @@ sequenceDiagram
 | paste / copy | `ctrl+v` · drag-select ships straight to the clipboard |
 | markdown export | `/export file.md` |
 | shell | `! <command>` |
+| teach a skill | `/learn <text\|url\|file>` → distills into `~/.hydra/skills/` |
+| install from the hub | `/hub` → arrow keys → `enter` installs after a security scan |
+| remove a skill | `/skill-del <name>` (goes to `skills/.trash/`) |
+| see what the model remembers | `/memory`, `/skills` |
+| sandbox | `/sandbox ask\|strict\|open` — risky tool commands ask **y/n** in the footer |
 
 ## ⚙️ providers & models
 
@@ -164,7 +184,7 @@ node --check hydra.mjs
 $env:HYDRA_CFG_DIR="$PWD\tmp-home"; $env:HYDRA_TEST="8"; node hydra.mjs
 ```
 
-Scenario numbers 1–9 drive the TUI end-to-end with zero human input: sessions & mouse (1–4), deep scrollback + export (5), rename (6), the custom-provider flow against a local mock `/v1/models` (7), palettes + search + fork (8), and a screenshot driver used to render the images above (9). The `docs/img/*.svg` are generated from the app's real ANSI frame stream — literally the TUI painting itself.
+Scenario numbers 1–17 drive the TUI end-to-end with zero human input: sessions & mouse (1–4), deep scrollback + export (5), rename (6), the custom-provider flow against a local mock `/v1/models` (7), palettes + search + fork (8), zombie-provider auto-skip (10), offline fallback (11), web injection + persistence (12), stale-popup protection (13), interrupt latency (14), skills + memory round-trip (15), sandbox y/n gating (16), skills hub install + deep-terminal cwd persistence (17), and a screenshot driver used to render the images above (9). The `docs/img/*.svg` are generated from the app's real ANSI frame stream — literally the TUI painting itself.
 
 ## 📄 license
 

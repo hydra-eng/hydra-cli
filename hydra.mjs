@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // ============================================================
-//  HYDRA v2.1.0 - fast local coding agent - opencode-style TUI
+//  HYDRA v3.1.0 - fast local coding agent - opencode-style TUI
 //  zero dependencies | ESM | node >= 18
+//  hermes-grade: skills (SKILL.md, /learn, /hub) + memory +
+//  self-improvement loop + sandbox (y/n gating) + deep terminal
 //  NOTE: never put ESC codes inside regex literals; use ANSI_RX
 // ============================================================
 import fs from "node:fs";
@@ -10,7 +12,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
 
-const VERSION = "3.0.0";
+const VERSION = "3.1.0";
 const ESC = String.fromCharCode(27);
 let CRIMSON = ESC + "[91m";
 let CRIMSONBG = ESC + "[0;48;2;220;20;60m";
@@ -127,9 +129,36 @@ async function runToolCall(tc, signal) {
   let result = "";
   try {
     if (tc.function?.name === "bash") {
-      const r = await runShellAsync(String(args.command || ""), CWD, TOOL_TIMEOUT, signal);
-      result = ((r.stdout || "") + (r.stderr ? "\n[stderr] " + r.stderr : "")).trim();
-      if (r.status) result += `[exit ${r.status}]`;
+      const r = await runBash(String(args.command || ""), TOOL_TIMEOUT, signal);
+      if (r.failed === "denied") {
+        result = "BLOCKED by hydra sandbox (mode " + SANDBOX_MODE() + ") - the command was NOT run. Use a safer approach, or tell the user they can approve it by running it with ! themselves.";
+      } else {
+        const code = r.status !== undefined ? r.status : r.code;
+        result = ((r.out !== undefined ? r.out : r.stdout || "") + ((r.err !== undefined ? r.err : r.stderr) ? "\n[stderr] " + (r.err !== undefined ? r.err : r.stderr) : "")).trim();
+        if (code) result += `[exit ${code}]`;
+      }
+    } else if (tc.function?.name === "skill_load") {
+      const body = readSkillBody(args.name, 8000);
+      result = body ? "[skill guide: " + args.name + "]\n" + body : "unknown skill: " + String(args.name || "") + " (call list via context: skill names are in the system prompt)";
+    } else if (tc.function?.name === "skill_write") {
+      if (CFG.skills_safe) { result = "BLOCKED - skills_safe is on. The user reviews every skill write; ask them to run /skills-safe to allow it."; }
+      else {
+        const slug = safeSkillName(args.name);
+        if (!slug) result = "bad skill name (letters/numbers/dashes, <=40 chars)";
+        else {
+          const desc = String(args.description || "").replace(/[\r\n]+/g, " ").slice(0, 200);
+          const body = String(args.body || "").slice(0, 20000);
+          const file = skillFile(slug);
+          fs.mkdirSync(path.dirname(file), { recursive: true });
+          atomicWrite(file, "---\nname: " + slug + "\ndescription: " + (desc || slug) + "\n---\n\n" + body + "\n");
+          result = "skill saved: " + slug + " (lives in " + shortPath(path.dirname(file)) + " \u00b7 its description is now in every session; the body loads on demand via skill_load or when the user starts a message with the skill name)";
+          addLog(cc(CRIMSON + BOLD, " \u2726 skill saved: ") + slug + cc(DIM, " \u00b7 triggers by name: " + slug + " <task>"));
+        }
+      }
+    } else if (tc.function?.name === "memory_write") {
+      const ok = memoryAppend(args.content || args.fact || "");
+      result = ok ? "remembered (memory.md, stays in every session)" : "not saved (duplicate or empty)";
+      if (ok) addLog(cc(CRIMSON + BOLD, " \u2726 remembered: ") + cc(DIM, String(args.content || args.fact || "").slice(0, 90)));
     } else if (tc.function?.name === "read") {
       result = fs.readFileSync(path.resolve(CWD, args.filePath), "utf8");
     } else if (tc.function?.name === "write") {
@@ -201,6 +230,9 @@ const TOOLS_SCHEMA = [
   { type: "function", function: { name: "list", description: "List a directory.", parameters: { type: "object", properties: { dirPath: { type: "string" } } } } },
   { type: "function", function: { name: "glob", description: "Find files by pattern like *.mjs.", parameters: { type: "object", properties: { pattern: { type: "string" }, dirPath: { type: "string" } }, required: ["pattern"] } } },
   { type: "function", function: { name: "grep", description: "Search file contents.", parameters: { type: "object", properties: { pattern: { type: "string" }, glob: { type: "string" }, dirPath: { type: "string" } }, required: ["pattern"] } } },
+  { type: "function", function: { name: "skill_load", description: "Load the full body of an installed skill before doing that task.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } } },
+  { type: "function", function: { name: "skill_write", description: "Save a reusable workflow as a skill (SKILL.md) for future sessions. name: kebab-case slug.", parameters: { type: "object", properties: { name: { type: "string" }, description: { type: "string" }, body: { type: "string" } }, required: ["name", "description", "body"] } } },
+  { type: "function", function: { name: "memory_write", description: "Persist one durable fact the user taught you (one short line).", parameters: { type: "object", properties: { content: { type: "string" } }, required: ["content"] } } },
 ];
 
 
@@ -300,15 +332,33 @@ const SESSION_START = Date.now();
 let TOOL_CALLS_TOTAL = 0;
 
 function SYS() {
-  return [
+  const parts = [
     "You are HYDRA, a coding agent inside a Windows terminal UI. Version " + VERSION + ".",
     "OS: Windows, PowerShell 5.1 (no apostrophes inside single-quoted PowerShell commands).",
     "Working directory: " + CWD + ".",
-    "You have tools: bash, read, write, edit, list, glob, grep.",
+    "You have tools: bash, read, write, edit, list, glob, grep, skill_load, skill_write, memory_write.",
     "Rules: act autonomously, do not ask questions. Prefer edit over rewrite.",
     "Use relative paths against the working directory when possible.",
     "Be concise in final answers. If a tool errors, adapt once, then answer.",
-  ].join("\n");
+  ];
+  const skills = listSkillDirs().slice(0, 40);
+  if (skills.length) {
+    parts.push("Installed skills (procedures you can follow). Load one with skill_load BEFORE doing a matching task; the user may also start a message with the skill name and then it is already loaded:");
+    let acc = 0;
+    for (const s of skills) { if (acc > 4200) break; const d = s.description || "(read with skill_load)"; acc += d.length; parts.push("  - " + s.name + ": " + d); }
+  }
+  const mem = readMemoryLines(12);
+  if (mem.length) {
+    parts.push("Durable memory the user taught you (keep honoring these):");
+    for (const l of mem) parts.push("  - " + l);
+  }
+  const lessons = readLessons(5).map((l) => { try { const j = JSON.parse(l); return j.topic + (j.outcome ? " \u2192 " + j.outcome : ""); } catch { return l.slice(0, 150); } }).filter(Boolean);
+  if (lessons.length) {
+    parts.push("Recent lessons from past sessions (what was tried and how it ended):");
+    for (const l of lessons) parts.push("  - " + l);
+  }
+  parts.push("Procedural memory: when you just worked out a non-trivial multi-step workflow that is likely reusable, save it with skill_write (name: kebab-case, description: one line, body: markdown steps). When the user states a durable preference or fact, save it with memory_write (one short line). Both persist across sessions.");
+  return parts.join("\n");
 }
 
 function runToolLabel(tc) {
@@ -317,8 +367,8 @@ function runToolLabel(tc) {
   return `${tc.function?.name || "?"} ${JSON.stringify(args).slice(0, 110)}`;
 }
 
-async function agentLoop(question, provider, ondelta, onTool, history, signal, noTools) {
-  const sys = SYS() + (noTools ? "\nPLAN MODE: Discuss and advise only. Do NOT call any tools this turn." : "");
+async function agentLoop(question, provider, ondelta, onTool, history, signal, noTools, extraSystem) {
+  const sys = SYS() + (noTools ? "\nPLAN MODE: Discuss and advise only. Do NOT call any tools this turn." : "") + (extraSystem ? "\n\n" + extraSystem : "");
   const messages = [{ role: "system", content: sys }, ...(history || []), { role: "user", content: question }];
   let finalText = "";
   for (let step = 0; step < MAX_STEPS; step++) {
@@ -509,6 +559,12 @@ const COMMANDS = [
   { name: "/mode", desc: "build/plan", hint: "" },
   { name: "/cd", desc: "change directory", hint: " [path]" },
   { name: "/clear", desc: "clear conversation", hint: "" },
+  { name: "/learn", desc: "distill material into a skill", hint: " <text|url|path>" },
+  { name: "/hub", desc: "browse + install hub skills", hint: "" },
+  { name: "/memory", desc: "show/clear durable memory", hint: " [clear]" },
+  { name: "/sandbox", desc: "ask|strict|open command gating", hint: "" },
+  { name: "/skills-safe", desc: "gate agent skill writes", hint: "" },
+  { name: "/skill-del", desc: "stash a hydra skill", hint: " <name>" },
   { name: "/help", desc: "all commands", hint: "" },
   { name: "/exit", desc: "quit hydra", hint: "" },
 ];
@@ -537,7 +593,13 @@ function helpLines() {
     cc(DIM, " /web <url>           fetch a web page into the conversation context"),
     cc(DIM, " /stats               turns \u00b7 approx tokens \u00b7 session/model/provider info"),
     cc(DIM, " /copylast            copy last reply to clipboard"),
-    cc(DIM, " /skills              inject a skill into context"),
+    cc(DIM, " /skills              inject a skill \u00b7 skills can also be called by name: <skill> <task>"),
+    cc(DIM, " /learn <src>         distill text/url/file into a NEW skill (agent writes it)"),
+    cc(DIM, " /hub                 browse + install community skills (scanned for secrets)"),
+    cc(DIM, " /memory              show what the agent remembered \u00b7 /memory clear wipes it"),
+    cc(DIM, " /sandbox ask|strict|open  gate risky commands behind y/n (default ask)"),
+    cc(DIM, " /skills-safe on|off  require your approval for agent skill writes"),
+    cc(DIM, " /skill-del <name>    stash a hydra skill (u-restorable pattern in .trash)"),
     cc(DIM, " /mcp                 list configured mcp servers"),
     cc(DIM, " /clear               reset conversation + screen"),
     cc(DIM, " /exit                quit"),
@@ -666,7 +728,7 @@ function atomicWrite(file, data) {
       if (st.size > 262144) { fs.writeFileSync(HB, line); return; }   // rotate: keep the most recent stretch only
     } catch { /* first write */ }
     try { fs.appendFileSync(HB, line); } catch { /* nop */ }
-  }, 1000);
+  }, 1000).unref();
 }
 function dbgMark(tag) {
   try { fs.appendFileSync(path.join(CFG_DIR, "last_run.txt"), `${new Date().toISOString()} ${tag} outTTY=${process.stdout.isTTY} inTTY=${process.stdin.isTTY} rows=${process.stdout.rows} cols=${process.stdout.columns}\n`); } catch { /* nop */ }
@@ -921,6 +983,7 @@ function popupActivate() {
   if (kind === "provider") { if (it.value === "pastekey") { startPasteKeyCapture(); return; } if (it.value === "other") { startCustomProvider(); return; } addLogLines(providerUseLines(it.value)); return; }
   if (kind === "custom") { providerPickModels(); return; }
   if (kind === "skills") { injectSkillValue(it.value); return; }
+  if (kind === "hub") { hubInstall(Number(it.value)); return; }
   if (kind === "theme") { applyTheme(String(it.value)); addLog(cc(CRIMSON + BOLD, "  palette -> " + it.value + " \u00b7 applies instantly, saved to config")); scheduleDraw(true); return; }
   if (t === "slash") { setUserInput((it.value || stripAnsi(it.label)).trim() + " "); syncSlashPopup(); return; }
 }
@@ -1057,20 +1120,235 @@ function sessionCount() {
   try { return fs.readdirSync(sessionsDir()).filter((f) => f.endsWith(".json")).length; } catch { return 0; }
 }
 const SKILL_DIRS = [
+  path.join(CFG_DIR, "skills"),                                          // hydra-native skills (agent can write here)
   path.join(os.homedir(), ".config", "opencode", "skills"),
   path.join(os.homedir(), ".claude", "skills"),
   path.join(os.homedir(), ".agents", "skills"),
 ];
+function skillDirsLL() { return SKILL_DIRS; }
+const SKILL_TRASH = () => path.join(CFG_DIR, "skills", ".trash");
+function safeSkillName(n) {
+  const s = String(n || "").toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return s && s !== ".trash" && !s.startsWith(".") ? s : "";
+}
+function skillFile(sname) { return path.join(CFG_DIR, "skills", sname, "SKILL.md"); }
+function readSkillBody(sname, cap) {
+  const s = safeSkillName(sname);
+  if (!s) return "";
+  try { return fs.readFileSync(skillFile(s), "utf8").slice(0, cap || 8000); } catch { /* fall through */ }
+  const found = listSkillDirs().find((x) => x.name.toLowerCase() === String(sname).toLowerCase());
+  if (!found) return "";
+  try { return fs.readFileSync(path.join(found.dir, found.name, "SKILL.md"), "utf8").slice(0, cap || 8000); } catch { return ""; }
+}
 function listSkillDirs() {
   const out = [];
+  const seen = new Set();
   for (const d of SKILL_DIRS) {
     let names = [];
     try { names = fs.readdirSync(d); } catch { continue; }
-    for (const n of names) try { if (fs.statSync(path.join(d, n)).isDirectory()) out.push({ name: n, dir: d }); } catch { /* nop */ }
+    for (const n of names) {
+      if (out.length >= 220) return out;
+      try {
+        if (!fs.statSync(path.join(d, n)).isDirectory()) continue;
+        if (seen.has(n.toLowerCase())) continue;
+        seen.add(n.toLowerCase());
+        let description = "";
+        try {
+          const head = fs.readFileSync(path.join(d, n, "SKILL.md"), "utf8").slice(0, 900);
+          const fm = head.match(/^description[ ]*:[ ]*(.+)$/im) || head.match(/"\s*description\s*"\s*:\s*"(.+?)"/);
+          if (fm) description = fm[1].trim();
+          else { const h = head.match(/^#+\s+(.+)$/m); if (h) description = h[1].trim().slice(0, 120); }
+        } catch { /* unreachable: no SKILL.md, keep name only */ }
+        out.push({ name: n, dir: d, description });
+      } catch { /* nop */ }
+    }
   }
   return out;
 }
 function skillsCount() { return listSkillDirs().length; }
+
+// ---- hermes-grade self-improvement layer:
+//   memory     = ~/.hydra/memory.md              small facts, always in context
+//   lessons    = ~/.hydra/learnings.jsonl         session transcript-of-results, last 5 injected
+//   skills     = ~/.hydra/skills/<slug>/SKILL.md  procedures, description always in context, body on demand
+const MEM_MD = path.join(CFG_DIR, "memory.md");
+const LESSONS_L = path.join(CFG_DIR, "learnings.jsonl");
+function readMemoryLines(cap) {
+  try {
+    return fs.readFileSync(MEM_MD, "utf8").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(-(cap || 12));
+  } catch { return []; }
+}
+function memoryAppend(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim().slice(0, 240);
+  if (!t) return false;
+  try {
+    const lines = readMemoryLines(50);
+    if (lines.some((l) => l.toLowerCase() === t.toLowerCase())) return false; // no duplicates
+    lines.push(t);
+    fs.mkdirSync(CFG_DIR, { recursive: true });
+    atomicWrite(MEM_MD, lines.slice(-20).join("\n") + "\n");
+    return true;
+  } catch { return false; }
+}
+function appendLearning(topic, tools, outcome) {
+  try {
+    fs.mkdirSync(CFG_DIR, { recursive: true });
+    fs.appendFileSync(LESSONS_L, JSON.stringify({ ts: new Date().toISOString(), topic: String(topic || "").slice(0, 80), tools: tools | 0, outcome: String(outcome || "").slice(0, 200) }) + "\n");
+  } catch { /* nop */ }
+}
+function readLessons(cap) {
+  try {
+    const raw = fs.readFileSync(LESSONS_L, "utf8").split(/\r?\n/).filter(Boolean);
+    return raw.slice(-(cap || 5));
+  } catch { return []; }
+}
+
+// ---- hub: /hub fetches the catalog, installs skill files after a security scan ((jsonl) check)
+const HUB_URL = process.env.HYDRA_HUB_URL || "https://raw.githubusercontent.com/hydra-eng/hydra-cli/master/hub.json";
+const HUB_BASE = process.env.HYDRA_HUB_BASE || "https://raw.githubusercontent.com/hydra-eng/hydra-cli/master/skills/";
+let HUB_CATALOG = [];
+async function hubInstall(idx) {
+  const entry = HUB_CATALOG[idx];
+  if (!entry || !entry.name) { addLog(cc(DIM, " nothing selected from the hub")); return; }
+  const slug = safeSkillName(entry.name);
+  if (!slug) { addLog(cc("\u001b[31m", " bad hub skill name: " + entry.name)); return; }
+  const hadBusy = UI.busy;
+  if (!hadBusy) startBusy("hub install");
+  try {
+    const raw = await fetchText(HUB_BASE + (entry.path || slug + ".md"), 15000);
+    const verdict = hubScan(raw);
+    if (verdict) { addLog(cc("\u001b[31m", " hub install blocked: " + verdict)); return; }
+    const file = skillFile(slug);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    atomicWrite(file, raw);
+    addLog(cc(CRIMSON + BOLD, " installed skill: ") + slug + cc(DIM, " (hub \u00b7 security scan ok \u00b7 type " + slug + " <task> to use it)"));
+  } catch (e) {
+    addLog(cc("\u001b[31m", " hub install failed: " + (e.message || e)));
+  } finally { if (!hadBusy) stopBusy(); scheduleDraw(true); }
+}
+const SECRET_RX = /(sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|gsk_[A-Za-z0-9]{20,}|BEGIN [A-Z ]*PRIVATE KEY|-----BEGIN)/;
+function hubScan(text) {
+  if (!text || text.length > 65536) return "too large or empty";
+  if (SECRET_RX.test(text)) return "looks like embedded credentials";
+  if (/Invoke-Expression|IEX\s*\(|Set-ExecutionPolicy|curl.*\|\s*(sh|bash|powershell)|irm\s+https?:/.test(text)) return "contains raw shell-eval or policy tampering";
+  return "";
+}
+async function fetchText(url, ms) {
+  const ac = new AbortController();
+  const to = setTimeout(() => { try { ac.abort(); } catch { /* nop */ } }, ms || 12000);
+  try {
+    const r = await fetch(url, { signal: ac.signal, headers: { "user-agent": "hydra-cli" } });
+    if (!r.ok) throw new Error("http " + r.status);
+    return await r.text();
+  } finally { clearTimeout(to); }
+}
+
+// ---- sandbox: ask|strict|open — gates destructive bash commands behind a y/n prompt
+const SANDBOX_MODE = () => String(process.env.HYDRA_SANDBOX || CFG.sandbox || "ask").toLowerCase();
+const RISKY_RX = /(^|[;&|]\s*)(rm\s+(-[a-z]*r[a-z]*f?|-[a-z]*f?-?[a-z]*r?)\b|remove-item\b.+-(recurse|force)|rd\s+\/s|del\s+\/[fqs].*\*|format(-volume)?\b|diskpart|reg\s+(delete|add)|set-executionpolicy|invoke-expression|\biex\b|taskkill\s+\/[fs]|git\s+(push\s+.*--force|--force.*push|reset\s+--hard|clean\s+-[fxd]))/i;
+function isRisky(cmd) { return RISKY_RX.test(String(cmd || "")); }
+let UI_CONFIRM = null;   // { label, resolve } while a sandbox y/n is pending
+function askUserConfirm(label, ms) {
+  const mode = SANDBOX_MODE();
+  if (!process.stdout.isTTY) return Promise.resolve(false);           // headless/scripts: refuse destructive by default
+  if (mode !== "ask" && mode !== "strict") return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const to = setTimeout(() => { if (UI_CONFIRM && UI_CONFIRM._resolve === resolve) { UI_CONFIRM = null; scheduleDraw(true); addLog(cc(DIM, " sandbox confirm timed out \u00b7 treated as no")); resolve(false); } }, ms || 120000);
+    UI_CONFIRM = { label, resolve: (v) => { clearTimeout(to); UI_CONFIRM = null; resolve(v); } };
+    UI_CONFIRM._resolve = resolve;
+    addLog(cc(CRIMSON + BOLD, " sandbox \u00b7 allow? ") + clip(label, Math.max(40, UI.cols - PANEL_W - 20)) + cc(DIM, "  y allow \u00b7 n/esc block"));
+    scheduleDraw(true);
+  });
+}
+
+// ---- deep terminal: one persistent PowerShell child so cwd/env survive between bash tool calls
+class DeepShell {
+  constructor() { this.child = null; this.seq = 0; this.current = null; }
+  spawn() {
+    if (this.child) return this.child;
+    const sh = process.env.SystemRoot ? process.env.SystemRoot + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" : "powershell.exe";
+    this.child = spawn(sh, ["-NoProfile", "-NoLogo", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"],
+      { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    this.child.on("exit", () => {
+      this.child = null;
+      const cur = this.current; this.current = null;
+      if (cur) cur.dead();
+    });
+    this.child.on("error", () => {
+      this.child = null;
+      const cur = this.current; this.current = null;
+      if (cur) cur.dead();
+    });
+    return this.child;
+  }
+  get alive() { return !!(this.child && this.child.stdin && this.child.stdin.writable); }
+  kill() {
+    try { if (this.child) this.child.kill(); } catch { /* nop */ }
+    this.child = null;
+    const cur = this.current; this.current = null;
+    if (cur) cur.dead();
+  }
+  // single flight: one command at a time (the tool loop is sequential by design)
+  run(cmd, timeoutMs, signal) {
+    if (this.current) return Promise.resolve({ code: -2, out: "", failed: "busy" });
+    if (/[\r\n]/.test(String(cmd || "")) || String(cmd).length >= 2000)
+      return Promise.resolve({ code: -3, out: "", failed: "multiline" });
+    const c = this.spawn();
+    if (!c || !this.alive) return Promise.resolve({ code: -1, out: "", failed: "spawn" });
+    const n = ++this.seq;
+    const tag = "__HDEND_" + n + "__";
+    return new Promise((resolve, reject) => {
+      let out = "", err = "", h = null, finished = false;
+      const finish = (fn, v) => { if (finished) return; finished = true; if (h) clearTimeout(h);
+        try { c.stdout.removeListener("data", onData); } catch { /* nop */ }
+        try { c.stderr.removeListener("data", onErr); } catch { /* nop */ }
+        if (signal) signal.removeEventListener("abort", onAbort);
+        this.current = null; fn(v); };
+      const onData = (d) => {
+        out += d;
+        const m = out.match(new RegExp("__HDEND_" + n + "_(\\d*)__"));
+        if (m) {
+          const idx = out.indexOf(m[0]);
+          out = out.slice(0, idx);
+          finish(resolve, { code: parseInt(m[1] || "0", 10) || 0, out, err });
+        }
+      };
+      const onErr = (d) => { err += d; };
+      const onAbort = () => { this.kill(); finish(reject, Object.assign(new Error("aborted"), { name: "AbortError" })); };
+      const onDead = () => finish(reject, Object.assign(new Error("deep shell died"), { name: "DeepDead" }));
+      this.current = { dead: onDead };
+      c.stdout.on("data", onData);
+      c.stderr.on("data", onErr);
+      if (signal) { if (signal.aborted) return onAbort(); signal.addEventListener("abort", onAbort); }
+      h = setTimeout(() => {
+        this.kill();
+        finish(resolve, { code: -4, out, err, failed: "timeout" });
+      }, Math.max(10000, timeoutMs || TOOL_TIMEOUT));
+      out = ""; err = "";
+      try { c.stdin.write(String(cmd) + ' ; Write-Output ("__HDEND_' + n + '_" + $LASTEXITCODE + "__")' + "\n"); }
+      catch { this.kill(); }
+    });
+  }
+}
+const DEEP_SHELL = new DeepShell();
+// one bash call: sandbox gate first, then persistent shell (single-line) with fresh-shell fallback
+async function runBash(cmd, timeoutMs, signal) {
+  const mode = SANDBOX_MODE();
+  if (mode !== "open" && isRisky(cmd)) {
+    const ok = await askUserConfirm(String(cmd || "").trim().slice(0, 120), 120000, signal);
+    if (!ok) return { code: -9, out: "", failed: "denied" };
+  }
+  if (!/[\r\n]/.test(String(cmd || "")) && String(cmd).length < 2000) {
+    try { return await DEEP_SHELL.run(cmd, timeoutMs, signal); }
+    catch (e) {
+      if (signal?.aborted || e.name === "AbortError") throw e;
+      // deep shell died or failed to spawn: fall through to a fresh shell, same semantics
+    }
+  }
+  return runShellAsync(cmd, CWD, timeoutMs, signal);
+}
+
+
 function mcpCount() { return CFG.mcps ? Object.keys(CFG.mcps).length : 0; }
 
 function sessionNameText() {
@@ -1344,7 +1622,10 @@ function drawFrame() {
   out.push(ESC + "[" + (rows - 3) + ";1H" + padRow(line2, LW) + cc(DIM, "~"));
   SCR[rows - 3] = plainRow(line2, LW) + "~";
   const busy = UI.busy;
-  const footL = busy
+  const conf = UI_CONFIRM;
+  const footL = conf
+    ? cc(CRIMSON + BOLD, " \u26a0 sandbox \u00b7 allow: ") + cc(DIM, clip(conf.label, Math.max(30, UI.cols - PANEL_W - 44))) + cc(CRIMSON + BOLD, "  y allow") + cc(DIM, " \u00b7 n/esc block")
+    : busy
     ? cc(CRIMSON + BOLD, " " + SPINNER_FRAMES[UI.spinner] + " " + UI.busyLabel) + cc(DIM, " " + fmtDur(Date.now() - UI.busyStart) + " \u00b7 esc interrupt")
     : " " + cc(DIM, CWD);
   let footR = busy ? (PENDING
@@ -1667,8 +1948,84 @@ async function submitLine() {
   }
   if (q === "/skills") {
     const s = listSkillDirs();
-    if (!s.length) { addLog(cc(DIM, " no skills found in " + SKILL_DIRS.join(" "))); return; }
-    openPopup("skills \u2502 enter injects", s.slice(0, 40).map((x, i) => ({ label: x.name, desc: " inject", value: i })));
+    if (!s.length) { addLog(cc(DIM, " no skills found in " + skillDirsLL().join(" ") + " \u00b7 say \u201ccreate a skill \u2026\u201d and hydra writes one itself")); return; }
+    openPopup("skills \u2502 enter injects", s.slice(0, 40).map((x, i) => ({ label: x.name, desc: " " + (x.description || "inject the full body"), value: i })));
+    return;
+  }
+  if (q.startsWith("/skill-del ")) {
+    const slug = safeSkillName(q.replace("/skill-del", "").trim());
+    if (!slug) { addLog(cc(DIM, " /skill-del <name> \u00b7 deletes a hydra skill (stashed into .trash first)")); return; }
+    const dir = path.join(CFG_DIR, "skills", slug);
+    const file = path.join(dir, "SKILL.md");
+    if (!fs.existsSync(file)) { addLog(cc(DIM, " no hydra skill named \u201c" + slug + "\u201d (external skills live in " + skillDirsLL().slice(1).join(" ") + ")")); return; }
+    try {
+      fs.mkdirSync(SKILL_TRASH(), { recursive: true });
+      const stash = String(Date.now()).padStart(13, "0") + "-" + slug;
+      fs.renameSync(dir, path.join(SKILL_TRASH(), stash));
+      addLog(cc(DIM, " stashed skill \u201c" + slug + "\u201d into .trash (" + stash + ")"));
+    } catch (e) { addLog(cc("\u001b[31m", " delete failed: " + (e.message || e))); }
+    scheduleDraw(true);
+    return;
+  }
+  if (q.startsWith("/skills-safe")) {
+    const arg = q.replace("/skills-safe", "").trim();
+    CFG.skills_safe = arg === "off" ? false : arg === "on" ? true : !CFG.skills_safe;
+    saveCfg();
+    addLog(cc(CRIMSON + BOLD, " skills_safe -> " + (CFG.skills_safe ? "on" : "off")) + cc(DIM, " \u00b7 on = hydra asks before the agent write/edit/delete any skill"));
+    return;
+  }
+  if (q.startsWith("/sandbox")) {
+    const arg = q.replace("/sandbox", "").trim().toLowerCase();
+    if (!["ask", "strict", "open"].includes(arg)) { addLog(cc(DIM, " /sandbox ask|strict|open \u00b7 current: ") + cc(CRIMSON + BOLD, SANDBOX_MODE()) + cc(DIM, " \u00b7 ask = confirm risky commands \u00b7 strict = confirm every command \u00b7 open = run all")); return; }
+    CFG.sandbox = arg; saveCfg();
+    addLog(cc(CRIMSON + BOLD, " sandbox -> " + arg));
+    return;
+  }
+  if (q.startsWith("/memory")) {
+    const arg = q.replace("/memory", "").trim();
+    if (arg === "clear" || arg === "wipe") {
+      try { fs.unlinkSync(MEM_MD); addLog(cc(DIM, " memory cleared")); } catch { addLog(cc(DIM, " memory was already empty")); }
+      scheduleDraw(true); return;
+    }
+    const mem = readMemoryLines(20);
+    if (!mem.length) { addLog(cc(DIM, " memory is empty \u00b7 the agent saves facts it learns with memory_write \u00b7 tell it \u201cremember: \u2026\u201d")); return; }
+    addLogLines([" memory.md (persisted facts):", ...mem.map((l) => cc(DIM, "   " + l))]);
+    return;
+  }
+  if (q.startsWith("/learn")) {
+    const src = q.replace("/learn", "").trim();
+    if (!src) { addLog(cc(DIM, " /learn <text|url|path> \u00b7 turns reference material into a reusable skill (the agent distills and saves it)")); return; }
+    let material = src;
+    const mUrl = src.match(/^https?:\/\//i);
+    try {
+      if (mUrl) {
+        addLog(cc(DIM, " fetching " + src));
+        const lines = await webInjectLines(src);
+        const glued = lines.map((l) => stripAnsi(l)).join("\n");
+        material = glued;
+      } else if (fs.existsSync(path.resolve(CWD, src)) && fs.statSync(path.resolve(CWD, src)).isFile()) {
+        material = fs.readFileSync(path.resolve(CWD, src), "utf8").slice(0, 60000);
+        material = "FILE: " + path.resolve(CWD, src) + "\n\n" + material;
+      }
+    } catch (e) { addLog(cc("\u001b[31m", " /learn source failed: " + (e.message || e))); return; }
+    const learnQ = "Turn the following material into a reusable skill. Distill it: synthesize frameworks, definitions, decision rules, steps and anti-patterns in your own words - NEVER copy long passages. Choose a kebab-case skill name matching the topic, write a one-line description, and save it with skill_write. If a skill with that name likely already exists, still do skill_write (it overwrites cleanly). Reply after saving with just the skill name and one line on when to use it.\n\n--- BEGIN MATERIAL ---\n" + material.slice(0, 50000) + "\n--- END MATERIAL ---";
+    addLog(cc(CRIMSON + BOLD, " learn: distilling into a skill"));
+    await runAgentTurn(learnQ);
+    return;
+  }
+  if (q.startsWith("/hub")) {
+    let catalog = null;
+    try {
+      const raw = await fetchText(HUB_URL, 12000);
+      const j = JSON.parse(raw.replace(/^\uFEFF/, ""));
+      catalog = (Array.isArray(j) ? j : j.skills || []).map((x) => typeof x === "string" ? { name: x, description: "" } : { name: String(x.name || ""), description: String(x.description || ""), path: String(x.path || "") }).filter((x) => x.name);
+    } catch (e) {
+      addLog(cc("\u001b[31m", " hub fetch failed: " + (e.message || e) + cc(DIM, " \u00b7 set HYDRA_HUB_URL to override")));
+      return;
+    }
+    if (!catalog.length) { addLog(cc(DIM, " hub is empty right now")); return; }
+    HUB_CATALOG = catalog;
+    openPopup("hub \u2502 enter installs \u00b7 " + catalog.length + " in catalog", catalog.slice(0, 40).map((x, i) => ({ label: x.name, desc: " " + (x.description || "install from the hub"), value: i })));
     return;
   }
   if (q === "/mcp") {
@@ -1787,11 +2144,24 @@ async function submitLine() {
   await runAgentTurn(q);
 }
 
-async function runAgentTurn(q) {
+async function runAgentTurn(q, extraSystem) {
   const provider = activeProvider();
   const plan = UI.mode === "Plan";
+  // hermes-style trigger: if the first word IS an installed skill name, its body is already in context
+  if (!extraSystem) {
+    const first = String(q || "").split(/\s+/)[0].replace(/[^\w-]/g, "").toLowerCase();
+    if (first.length >= 2) {
+      const body = readSkillBody(first, 8000);
+      if (body) {
+        extraSystem = "[skill guide: " + first + " \u00b7 loaded automatically because the user asked by name]\n" + body;
+        addLog(cc(DIM, " skill \u201c" + first + "\u201d loaded automatically"));
+      }
+    }
+  }
+  const t0 = TOOL_CALLS_TOTAL;
   let streamed = "";
   let curLog = null;
+  let outcome = "no reply";
   ABORT = new AbortController();
   startBusy(plan ? "Planning" : "Building");
   try {
@@ -1804,12 +2174,13 @@ async function runAgentTurn(q) {
     }, (tool) => {
       addLog(cc(CRIMSON, "  > ") + cc(DIM, truncateLine(tool, Math.max(30, UI.cols - PANEL_W - 4))));
       curLog = null; streamed = "";
-    }, HISTORY, ABORT.signal, plan);
+    }, HISTORY, ABORT.signal, plan, extraSystem);
     if (plan) addLog(cc(DIM, "  (plan mode - no tools were run)"));
-    if (!streamed.trim() && ABORT.signal.aborted) addLog(cc(DIM, " interrupted"));
-    else if (streamed.trim()) addLog(cc(DIM, "  \u23f1 " + fmtDur(Date.now() - UI.busyStart) + " \u00b7 " + stripAnsi(streamed).length + " chars \u00b7 turn done"));
+    if (!streamed.trim() && ABORT.signal.aborted) { addLog(cc(DIM, " interrupted")); outcome = "interrupted"; }
+    else if (streamed.trim()) { outcome = "replied " + stripAnsi(streamed).length + " chars"; addLog(cc(DIM, "  \u23f1 " + fmtDur(Date.now() - UI.busyStart) + " \u00b7 " + stripAnsi(streamed).length + " chars \u00b7 turn done")); }
   } catch (e) {
     const timedOut = e.name === "TimeoutError" || /timed out|aborted due to timeout/.test(e.message || "");
+    outcome = e.name === "AbortError" ? "interrupted" : timedOut ? "model timed out" : "turn error";
     const msg = e.name === "AbortError" ? "interrupted" : timedOut ? "model timed out after " + Math.round(MODEL_TIMEOUT / 1000) + "s \u00b7 provider \u201c" + provider.name + "\u201d not responding \u00b7 esc interrupts too \u00b7 HYDRA_MODEL_TIMEOUT tunes this" : (e.message || String(e));
     addLog(cc(e.name === "AbortError" ? DIM : timedOut ? "\u001b[33m" : "\u001b[31m", " " + msg));
     if (/model.*not.*found|invalid model|model_id|http 404\b/i.test(e.message || "")) addLog(cc(DIM, " the provider didn't take that model id \u00b7 /model opens the live list for this provider \u00b7 /provider use <name> flips back"));
@@ -1818,6 +2189,7 @@ async function runAgentTurn(q) {
   stopBusy();
   ABORT = null;
   saveSession();
+  appendLearning(q, TOOL_CALLS_TOTAL - t0, outcome.slice(0, 200));
   genSessionTitle().catch(() => { /* best-effort */ });
   if (PENDING) {
     const f = PENDING;
@@ -1950,6 +2322,14 @@ function onKey(str, key) {
         return;
       }
       return;
+    }
+    // ---- sandbox y/n confirm wins over everything except the custom capture
+    if (UI_CONFIRM) {
+      const cfr = UI_CONFIRM;
+      if (str === "y" || str === "Y") { cfr.resolve(true); scheduleDraw(true); return; }
+      if (str === "n" || str === "N" || key.name === "escape" || key.name === "backspace") { cfr.resolve(false); scheduleDraw(true); return; }
+      if (key.name === "pageup" || key.name === "pagedown") { /* scrolling during a confirm stays available */ }
+      else return;   // modal: y/n/esc only while the question is pending
     }
     // ---- sessions dialog ( modal keys first: browse works even mid-turn )
     if (UI.dialog) {
@@ -2154,6 +2534,21 @@ function plainSession() {
         else console.log("cwd: " + CWD);
       } else if (q === "/mode") { UI.mode = UI.mode === "Build" ? "Plan" : "Build"; console.log("mode -> " + UI.mode); }
       else if (q === "/clear") { HISTORY = []; console.log("context cleared"); }
+      else if (q.startsWith("/memory")) {
+        if (/^clear|wipe$/.test(q.replace("/memory", "").trim())) { try { fs.unlinkSync(MEM_MD); console.log("memory cleared"); } catch { console.log("memory was already empty"); } }
+        else { const mem = readMemoryLines(20); console.log(mem.length ? mem.map((l) => "  " + l).join("\n") : "memory is empty"); }
+      }
+      else if (q.startsWith("/sandbox")) {
+        const arg = q.replace("/sandbox", "").trim().toLowerCase();
+        if (["ask", "strict", "open"].includes(arg)) { CFG.sandbox = arg; saveCfg(); console.log("sandbox -> " + arg); }
+        else console.log("sandbox: " + SANDBOX_MODE() + " (/sandbox ask|strict|open)");
+      }
+      else if (q.startsWith("/skills-safe")) {
+        const arg = q.replace("/skills-safe", "").trim();
+        CFG.skills_safe = arg === "off" ? false : arg === "on" ? true : !CFG.skills_safe;
+        saveCfg(); console.log("skills_safe -> " + (CFG.skills_safe ? "on" : "off"));
+      }
+      else if (q === "/skills") { listSkillDirs().slice(0, 40).forEach((s) => console.log(s.name + (s.description ? ": " + s.description : ""))); }
       else if (q.startsWith("!")) {
         const cmd = q.slice(1).trim();
         try {
@@ -2563,6 +2958,133 @@ async function main() {
     setTimeout(() => { "/stats".split("").forEach((c) => send(c)); }, 4200);   // typed DURING the tool call
     setTimeout(() => send("", { name: "return" }), 4500);          // must land while the tool is still running (UI alive)
     setTimeout(() => process.exit(0), 20000);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "15") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // hermes port: agent saves a skill + memory fact, then the skill triggers BY NAME next turn
+    const httpm = await import("node:http");
+    const srv = httpm.createServer((req, res) => {
+      const body = [];
+      req.on("data", (c) => body.push(c));
+      req.on("end", () => {
+        const raw = Buffer.concat(body).toString();
+        if (req.method === "POST" && String(req.url).includes("chat/completions")) {
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          if (raw.includes('"role":"tool"')) res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "SAVED flyingstep" } }] }) + "\n\n");
+          else if (raw.includes("fly-skill-body-v1")) res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "LOADED fly-skill-marker" } }] }) + "\n\n");
+          else res.write("data: " + JSON.stringify({ choices: [{ delta: { tool_calls: [
+            { index: 0, id: "c1", type: "function", function: { name: "skill_write", arguments: JSON.stringify({ name: "flyingstep", description: "Greets loudly via the fly procedure", body: "# Fly\nStep one: greet the user looooud (fly-skill-body-v1)." }) } },
+            { index: 1, id: "c2", type: "function", function: { name: "memory_write", arguments: JSON.stringify({ content: "User prefers deep-terminal persistence between bash calls" }) } },
+          ] } }] }) + "\n\n");
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } else res.end(JSON.stringify({ data: [{ id: "alpha-a" }] }));
+      });
+    });
+    await new Promise((ok) => srv.listen(7090, "127.0.0.1", ok));
+    srv.unref?.();
+    loadCfg();
+    CFG.providers["prov-live"] = { name: "prov-live", baseURL: "http://127.0.0.1:7090/v1", apiKey: "key-s15", model: "alpha-a" };
+    CFG.active = "prov-live";
+    saveCfg();
+    setTimeout(() => { "save greet flow".split("").forEach((c) => send(c)); }, 1300);
+    setTimeout(() => send("", { name: "return" }), 1700);       // skill_write + memory_write land
+    setTimeout(() => { "flyingstep now".split("").forEach((c) => send(c)); }, 6300);
+    setTimeout(() => send("", { name: "return" }), 6700);       // name-trigger -> body in context
+    setTimeout(() => process.exit(0), 12500);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "16") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // sandbox: risky bash asks y/n; y runs it, n blocks it
+    const httpm = await import("node:http");
+    const rmCmd = "Remove-Item C:\\not_a_real_place_hydra -Recurse -Force; Write-Output hyd-d16-ran";
+    const srv = httpm.createServer((req, res) => {
+      const body = [];
+      req.on("data", (c) => body.push(c));
+      req.on("end", () => {
+        const raw = Buffer.concat(body).toString();
+        if (req.method === "POST" && String(req.url).includes("chat/completions")) {
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          if (raw.includes('"role":"tool"')) {
+            const denied = /BLOCKED by hydra sandbox/.test(raw);
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { content: denied ? "SANDBOX DENIED" : "SANDBOX RAN hyd-d16-ran" } }] }) + "\n\n");
+          } else {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: rmCmd }) } }] } }] }) + "\n\n");
+          }
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } else res.end(JSON.stringify({ data: [{ id: "alpha-a" }] }));
+      });
+    });
+    await new Promise((ok) => srv.listen(7091, "127.0.0.1", ok));
+    srv.unref?.();
+    loadCfg();
+    CFG.providers["prov-live"] = { name: "prov-live", baseURL: "http://127.0.0.1:7091/v1", apiKey: "key-s16", model: "alpha-a" };
+    CFG.active = "prov-live";
+    saveCfg();
+    setTimeout(() => { "one danger".split("").forEach((c) => send(c)); }, 1300);
+    setTimeout(() => send("", { name: "return" }), 1700);       // tool asks y/n (sandbox=ask default)
+    setTimeout(() => send("y"), 4200);                           // allow - output must land
+    setTimeout(() => { "two danger".split("").forEach((c) => send(c)); }, 9600);
+    setTimeout(() => send("", { name: "return" }), 10000);
+    setTimeout(() => send("n"), 12000);                          // block this one
+    setTimeout(() => process.exit(0), 17000);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "17") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // /hub install (scanned, from a mock hub) + deep terminal cwd persistence across bash calls
+    const httpm = await import("node:http");
+    const srv = httpm.createServer((req, res) => {
+      const url = String(req.url);
+      if (url === "/hub.json") { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ skills: [{ name: "deepfly", description: "flies the deep terminal marker", path: "deepfly.md" }] })); return; }
+      if (url === "/skills/deepfly.md") { res.writeHead(200, { "Content-Type": "text/markdown" }); res.end("---\nname: deepfly\ndescription: flies the deep terminal marker\n---\nStep: run the persistence probe deep-cwd-b.\nhub-deepfly-body"); return; }
+      const body = [];
+      req.on("data", (c) => body.push(c));
+      req.on("end", () => {
+        const raw = Buffer.concat(body).toString();
+        if (req.method === "POST" && url.includes("chat/completions")) {
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          if (raw.includes('"role":"tool"')) {
+            const m17 = [...raw.matchAll(/\{"role":"tool".*?"content":"((?:[^"\\]|\\.)*)"\}/g)];
+            let last17 = "";
+            try { last17 = m17.length ? JSON.parse(m17[m17.length - 1][1]) : ""; } catch { last17 = m17.length ? m17[m17.length - 1][1] : ""; }
+            if (last17.includes("deep-cwd-a")) {
+              res.write("data: " + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "c2", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "Write-Output ('cwd=' + (Get-Location).Path)" }) } }] } }] }) + "\n\n");
+            } else if (/cwd=.*[\\/]home/.test(last17)) {
+              res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "PWDOK deep-cwd-b" } }] }) + "\n\n");
+            } else {
+              res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "PWDERR" } }] }) + "\n\n");
+            }
+          } else if (raw.includes("hub-deepfly-body")) {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "DEEPFLY ON" } }] }) + "\n\n");
+          } else {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "Set-Location home; Write-Output deep-cwd-a" }) } }] } }] }) + "\n\n");
+          }
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } else res.end(JSON.stringify({ data: [{ id: "alpha-a" }] }));
+      });
+    });
+    await new Promise((ok) => srv.listen(7092, "127.0.0.1", ok));
+    srv.unref?.();
+    loadCfg();
+    CFG.providers["prov-live"] = { name: "prov-live", baseURL: "http://127.0.0.1:7092/v1", apiKey: "key-s17", model: "alpha-a" };
+    CFG.active = "prov-live";
+    saveCfg();
+    setTimeout(() => { "go deep".split("").forEach((c) => send(c)); }, 1300);
+    setTimeout(() => send("", { name: "return" }), 1700);       // bash1 (cd home) -> pwd bash2 -> PWDOK (cwd persisted)
+    setTimeout(() => { "/hub".split("").forEach((c) => send(c)); }, 7200);
+    setTimeout(() => send("", { name: "return" }), 7600);       // submit /hub -> hub popup
+    setTimeout(() => send("", { name: "return" }), 8600);       // enter installs deepfly (scanned) + closes popup
+    setTimeout(() => { "deepfly check".split("").forEach((c) => send(c)); }, 10600);
+    setTimeout(() => send("", { name: "return" }), 11000);      // skill trigger -> DEEPFLY ON
+    setTimeout(() => process.exit(0), 16500);
     return;
   }
   if (process.env.HYDRA_TEST) {
