@@ -10,7 +10,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
 
-const VERSION = "2.9.5";
+const VERSION = "3.0.0";
 const ESC = String.fromCharCode(27);
 let CRIMSON = ESC + "[91m";
 let CRIMSONBG = ESC + "[0;48;2;220;20;60m";
@@ -641,6 +641,33 @@ function shortPath(p) {
 function crashLog(err) {
   try { fs.appendFileSync(path.join(CFG_DIR, "crash.log"), new Date().toISOString() + "\n" + (err.stack || String(err)) + "\n\n"); } catch { /* nop */ }
 }
+// atomic-ish session save: write to a temp sibling then rename, so a crash can never leave a half-written session
+function atomicWrite(file, data) {
+  const tmp = file + ".tmp" + String(process.pid);
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, file);
+}
+
+// production watchdog: every 1s record loop lag + state into ~/.hydra/heartbeat.txt,
+// so a frozen session can always be diagnosed after the fact (which second it stalled, in which tool)
+{
+  const HB = path.join(CFG_DIR, "heartbeat.txt");
+  let hbNext = Date.now() + 1000;
+  setInterval(() => {
+    const now = Date.now();
+    const lag = Math.max(0, now - hbNext);
+    hbNext = now + 1000;
+    const line = new Date(now).toISOString() + " lag=" + lag + "ms"
+      + (UI.busy ? " busy=" + (UI.busyLabel || "?") : " idle")
+      + " turn=" + UI.turn + " tools=" + TOOL_CALLS_TOTAL
+      + " outKB=" + Math.round((process.stdout.writableLength || 0) / 1024) + "\n";
+    try {
+      const st = fs.statSync(HB);
+      if (st.size > 262144) { fs.writeFileSync(HB, line); return; }   // rotate: keep the most recent stretch only
+    } catch { /* first write */ }
+    try { fs.appendFileSync(HB, line); } catch { /* nop */ }
+  }, 1000);
+}
 function dbgMark(tag) {
   try { fs.appendFileSync(path.join(CFG_DIR, "last_run.txt"), `${new Date().toISOString()} ${tag} outTTY=${process.stdout.isTTY} inTTY=${process.stdin.isTTY} rows=${process.stdout.rows} cols=${process.stdout.columns}\n`); } catch { /* nop */ }
 }
@@ -695,14 +722,13 @@ function nudgeScroll(n) {
   scheduleDraw();
 }
 
-function pasteClipboard() {
+async function pasteClipboard() {
+  // async spawn with a tight cap: a clipboard held by another process used to brick the UI for up to 15s
   startBusy("pasting");
   try {
-    const sh = process.env.SystemRoot ? process.env.SystemRoot + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" : "powershell.exe";
-    const r = spawnSync(sh, ["-NoProfile", "-NoLogo", "-Command", "Get-Clipboard -Raw"],
-      { timeout: 15000, encoding: "utf8", windowsHide: true });
-    if (r.status) { stopBusy(); addLog(cc("\u001b[31m", " paste failed (exit " + r.status + ")")); return; }
-    let txt = String(r.stdout || "").replace(/\r/g, "").replace(/\n+/g, " ").trim();
+    const r = await runShellAsync("Get-Clipboard -Raw", CWD, 3000).catch(() => null);
+    let txt = String(((r && r.status === 0) ? r.stdout : "") || "").replace(/\r/g, "").replace(/\n+/g, " ").trim();
+    if (!txt && !(r && r.status === 0)) { stopBusy(); addLog(cc("\u001b[31m", " paste failed (clipboard busy or unavailable)")); return; }
     if (!txt) { stopBusy(); addLog(cc(DIM, " clipboard empty")); return; }
     if (txt.length > 4000) txt = txt.slice(0, 4000);
     setUserInput((UI.input + txt).slice(0, 8000));
@@ -713,20 +739,35 @@ function pasteClipboard() {
 
 function listSessions() {
   try {
-    return fs.readdirSync(sessionsDir()).filter((f) => f.endsWith(".json")).sort().reverse()
+    return fs.readdirSync(sessionsDir()).filter((f) => f.endsWith(".json")).sort().reverse().slice(0, 400)
       .map((f) => {
         let turns = 0, whenISO = "";
         let name = f.replace(/\.json$/, "");
         if (/^\d{4}-\d{2}-\d{2}T/.test(name) && name.length >= 24) {
           name = name[24] === "-" ? name.slice(25) : (name.slice(5, 10) + " " + name.slice(11, 16).replace("-", ":"));
         }
+        // head-slice read (max ~600B): session schema stores when/name first, history last -
+        // opening the dialog over a huge store then costs O(600B x N) instead of full-file reads
         try {
-          let rawN = fs.readFileSync(path.join(sessionsDir(), f), "utf8");
+          let rawN = "";
+          const fd = fs.openSync(path.join(sessionsDir(), f), "r");
+          try { const b = Buffer.alloc(600); const n = fs.readSync(fd, b, 0, 600, 0); rawN = b.toString("utf8", 0, Math.max(0, n)); }
+          finally { try { fs.closeSync(fd); } catch { /* nop */ } }
           if (rawN.charCodeAt(0) === 0xFEFF) rawN = rawN.slice(1);
-          const j = JSON.parse(rawN);
-          turns = (j.history || []).length;
-          whenISO = j.when || "";
-          if (j.name) return { value: f, name: String(j.name), whenISO, turns };
+          let j = null;
+          try { j = JSON.parse(rawN); } catch { /* truncated is expected; regex below */ }
+          if (!j) {
+            const mn = /"name"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(rawN);
+            const mw = /"when"\s*:\s*"([^"]*)"/.exec(rawN);
+            if (mn || mw) {
+              try { j = { name: mn ? JSON.parse('"' + mn[1] + '"') : null, when: mw ? mw[1] : "", history: rawN.includes('"history"') ? undefined : [] }; } catch { j = null; }
+            }
+          }
+          if (j) {
+            turns = j.history && Array.isArray(j.history) ? j.history.length : turns;
+            whenISO = j.when || "";
+            if (j.name) return { value: f, name: String(j.name), whenISO, turns };
+          }
         } catch { /* unparsable: fall through to filename name */ }
         return { value: f, name: name || "chat", whenISO, turns };
       });
@@ -972,7 +1013,7 @@ function commitRenameDialog() {
     const kebab = nm.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "session";
     const ts = (/^([0-9]{4}-[0-9]{2}-[0-9]{2}T[\d-]+Z)/.exec(String(it.value)) || [])[1] || "";
     const newPath = ts ? ts + "-" + kebab + ".json" : String(it.value);
-    fs.writeFileSync(path.join(sessionsDir(), newPath), JSON.stringify(j, null, 2));
+    atomicWrite(path.join(sessionsDir(), newPath), JSON.stringify(j, null, 2));
     if (newPath !== String(it.value)) stashReplace(it.value);   // pre-rename copy lands in .trash
     if (wasActive) { ACTIVE_SESSION_FILE = newPath; CURRENT_SESSION_TITLE = nm; }
   } catch (e) { addLog(cc("\u001b[31m", " rename failed: " + (e.message || e))); }
@@ -1059,7 +1100,7 @@ function saveSession() {
     const kebab = disp.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "chat";
     const file = sessionFileTS() + "-" + kebab + ".json";
     const full = path.join(sessionsDir(), file);
-    fs.writeFileSync(full, JSON.stringify({
+    atomicWrite(full, JSON.stringify({
       when,
       name: disp,
       provider: activeProvider().name,
@@ -1160,12 +1201,13 @@ function loadSessionFile(file) {
 
 function drawFrame() {
   if (!process.stdout.isTTY) return;
+  // backpressure guard: if the console is not draining our frames, skip this one instead of flooding (opencode-style renderer discipline)
+  if (process.stdout.writableLength > 98304) { scheduleDraw(); return; }
   const cols = UI.cols, rows = UI.rows;
   if (rows < 16 || cols < 56) {
     process.stdout.write(ESC + "[?25l" + ESC + "[2J" + ESC + "[H" + ESC + "[1;1H" + padRow(" terminal too small - need >=56x16 (have " + cols + "x" + rows + ")", cols));
     return;
   }
-  loadCfg();
   const BODY = rows - 6;
   const barX = cols - PANEL_W;
   const LW = barX - 1;
@@ -1618,10 +1660,8 @@ async function submitLine() {
     try {
       const txt = String(lu.content || "").slice(0, 100000);
       const b64 = Buffer.from(txt, "utf8").toString("base64");
-      const ps = spawnSync(process.env.SystemRoot ? process.env.SystemRoot + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" : "powershell.exe",
-        ["-NoProfile", "-NoLogo", "-Command", "Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "')))"],
-        { windowsHide: true, timeout: 15000 });
-      addLog(cc(DIM, ps.status ? " copy failed (exit " + ps.status + ")" : " last reply copied to clipboard (" + txt.length + " chars)"));
+      const r = await runShellAsync("Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "')))", CWD, 3000).catch(() => null);
+      addLog(cc(DIM, r && r.status === 0 ? " last reply copied to clipboard (" + txt.length + " chars)" : " copy failed (clipboard busy or unavailable)"));
     } catch (e) { addLog(cc("\u001b[31m", " copy failed: " + e.message)); }
     return;
   }
@@ -1671,7 +1711,7 @@ async function submitLine() {
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
     const file = ts + "-" + kebabN + ".json";
     try {
-      fs.writeFileSync(path.join(sessionsDir(), file), JSON.stringify({
+      atomicWrite(path.join(sessionsDir(), file), JSON.stringify({
         when: new Date().toISOString(), name, provider: activeProvider().name, model: activeProvider().model, cwd: CWD, history: hist,
       }, null, 2));
       SESSIONS_DIRTY = true;
@@ -1721,7 +1761,7 @@ async function submitLine() {
       const kebab = nm.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "session";
       const ts = (/^([0-9]{4}-[0-9]{2}-[0-9]{2}T[\d-]+Z)/.exec(String(ACTIVE_SESSION_FILE)) || [])[1] || "";
       const newPath = ts ? ts + "-" + kebab + ".json" : String(ACTIVE_SESSION_FILE);
-      fs.writeFileSync(path.join(sessionsDir(), newPath), JSON.stringify(j, null, 2));
+      atomicWrite(path.join(sessionsDir(), newPath), JSON.stringify(j, null, 2));
       if (newPath !== String(ACTIVE_SESSION_FILE)) stashReplace(ACTIVE_SESSION_FILE);   // pre-rename copy lands in .trash
       ACTIVE_SESSION_FILE = newPath; CURRENT_SESSION_TITLE = nm;
       SESSIONS_DIRTY = true;
@@ -1817,13 +1857,11 @@ function selectionText(sel) {
   return lines.filter((l) => l.length).join("\n");
 }
 function copyToClipboard(txt) {
+  // fire-and-forget async spawn: the clipboard request can never stall the frame loop
   try {
     const b64 = Buffer.from(txt, "utf8").toString("base64");
     process.stdout.write(ESC + "]52;c;" + b64 + ESC + "\\");
-    const sh = process.env.SystemRoot ? process.env.SystemRoot + "\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" : "powershell.exe";
-    spawnSync(sh, ["-NoProfile", "-NoLogo", "-Command",
-      "Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "')))"],
-      { windowsHide: true, timeout: 15000 });
+    runShellAsync("Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "')))", CWD, 3000).catch(() => { /* nop */ });
   } catch { /* nop */ }
 }
 function onKey(str, key) {
