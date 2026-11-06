@@ -649,6 +649,8 @@ function helpLines() {
     cc(DIM, " @file.md             attach a file to your message (\u22644 files \u00b7 \u2264240 KB each)"),
     cc(DIM, " \u23f3 queueing           type + enter while a turn runs: your prompt waits, then runs"),
     cc(DIM, " todo tool            the model keeps a visible checklist for multi-step work"),
+    cc(DIM, " \u2398 copy / paste       drag-select copies \u00b7 ctrl+a copies the screen \u00b7 esc clears \u00b7 ctrl+v paste"),
+    cc(DIM, " ctrl+c               first press copies the selection / clears the prompt \u00b7 again exits"),
     cc(DIM, " /skills              list installed skills (agent + opencode/claude dirs)"),
     cc(DIM, " /learn <src>         distill text/url/file into a NEW skill (agent writes it)"),
     cc(DIM, " /hub                 browse + install community skills (secret scan at install)"),
@@ -738,6 +740,8 @@ const UI = {
   dialog: null, // { kind:"sessions", sel:0, items:[{value,name,when,turns,whenISO}], file:"", preview:[] }
   QUEUE: [],    // typed-during-a-turn prompts, flushed at the turn's end (opencode/Claude-style queueing)
   TODOS: [],    // the model's visible checklist (todo_write tool), {text, done}
+  TOAST: null,  // { text, until } — short notification card shown above the composer
+  CC_TS: 0,     // last ctrl+c timestamp (double-press to exit, claude-code style)
 };
 
 function centerText(text, width) {
@@ -826,7 +830,7 @@ function scheduleDraw(full) {
   drawTimer = setTimeout(() => { drawTimer = null; try { drawFrame(); } catch (e) { crashLog(e); } }, 40);
 }
 function addLog(text) {
-  UI.log.push({ text: String(text), cache: null });
+  UI.log.push({ text: String(text), cache: null, t: Date.now() });
   if (UI.log.length > 3000) {
     const dropped = UI.log.splice(0, UI.log.length - 3000);
     let dwl = 0;
@@ -835,6 +839,7 @@ function addLog(text) {
   }
   scheduleDraw();
 }
+function toast(text, ms) { UI.TOAST = { text: String(text || ""), until: Date.now() + (ms || 2600) }; scheduleDraw(); }
 function addLogLines(lines) { for (const l of lines || []) addLog(l); }
 function setUserInput(v) { UI.input = v; syncSlashPopup(); UI.scroll = 0; scheduleDraw(); }
 
@@ -1570,7 +1575,7 @@ function drawFrame() {
     process.stdout.write(ESC + "[?25l" + ESC + "[2J" + ESC + "[H" + ESC + "[1;1H" + padRow(" terminal too small - need >=56x16 (have " + cols + "x" + rows + ")", cols));
     return;
   }
-  const BODY = rows - 6;
+  const BODY = rows - 7;   // +1 row reserved for the composer's top border underneath the body
   const barX = cols - PANEL_W;
   const LW = barX - 1;
   const p0 = activeProvider();
@@ -1580,10 +1585,13 @@ function drawFrame() {
     : WORDMARK;
   const scroll = [];
   for (const l of COMBO) scroll.push(cc(CRIMSON + BOLD, centerText(l, LW)));
+  const NOW_MS = Date.now();
   // -------- compose chat log flat lines into the same scrollback
   for (const e of UI.log) {
     if (!e.cache || e.cacheW !== LW) { e.cache = wrapText(e.text, LW - 1); e.cacheW = LW; }
-    for (const l of e.cache) scroll.push(l);
+    const fresh = NOW_MS - (e.t || 0) < 1500;   // brand-new rows leak in bright for a beat, then settle (log flash-in)
+    if (fresh) e.cache.forEach((l, ix) => scroll.push(ix === 0 ? cc(CRIMSON + BOLD, "\u258e ") + l : l));
+    else for (const l of e.cache) scroll.push(l);
   }
   const maxScroll = Math.max(0, scroll.length - BODY);
   UI.scroll = clamp(UI.scroll, 0, maxScroll);
@@ -1616,9 +1624,9 @@ function drawFrame() {
     const pl = pflat[i] || "";
     out.push(ESC + "[" + (2 + i) + ";1H"
       + padRow(" " + t + " ", LW)
-      + cc(DIM, "\u2502")
+      + cc(DIM, "\u2562")
       + padRow(pl, PANEL_W));
-    SCR[2 + i] = " " + plainRow(t, LW - 1) + " \u2502" + plainRow(pl, PANEL_W);
+    SCR[2 + i] = " " + plainRow(t, LW - 1) + " \u2562" + plainRow(pl, PANEL_W);
   }
   // -------- popup overlay ( rows R-11 .. R-5, drawn over the body )
   const popTop = rows - 11;
@@ -1698,20 +1706,31 @@ function drawFrame() {
     }
     out.push(ESC + "[" + dbot + ";1H" + padRow(cc(DIM, " \u2514\u2500\u2500 " + (items.length ? items.length + " sessions \u00b7 " : "") + "cwd, skills and provider are kept when you switch"), dw));
   }
-  // -------- composer box ( rows R-4 .. R-2 )
-  const BAR = cc(CRIMSON, "\u258C");
-  out.push(ESC + "[" + (rows - 4) + ";1H" + ESC + "[K" + BAR + "  " + UI.input);
-  SCR[rows - 4] = "\u258c  " + UI.input;
+  // -------- composer box ( rows R-5 .. R-2 ): bordered two-row prompt with a live queue cue
+  {
+    const qN = UI.QUEUE.length;
+    const bTitle = qN ? " \u276f queue " + qN + " " : " \u276f new turn ";
+    const boxIn = Math.max(8, barX - 5);
+    const top = cc(CRIMSON, "\u256D\u2500") + cc(CRIMSON + BOLD, bTitle) + cc(CRIMSON, "\u2500".repeat(Math.max(6, boxIn - stripAnsi(bTitle).length)) + "\u256E");
+    out.push(ESC + "[" + (rows - 5) + ";1H" + ESC + "[K" + top);
+    SCR[rows - 5] = plainRow(top, barX - 1);
+  }
+  const BAR = "\u2502";
+  out.push(ESC + "[" + (rows - 4) + ";1H" + ESC + "[K" + BAR + " \u276f " + UI.input);
+  SCR[rows - 4] = "\u2502 \u276f " + UI.input;
   const modelShort = clip(p0.model, Math.max(14, LW - 34));
   const line2 = BAR + " " + cc(CRIMSON + BOLD, " " + UI.mode) + cc(DIM, " \u00b7 ") + cc(CRIMSON, modelShort) + (p0.apiKey ? "" : cc(DIM, "  (local)"));
-  out.push(ESC + "[" + (rows - 3) + ";1H" + padRow(line2, LW) + cc(DIM, "~"));
-  SCR[rows - 3] = plainRow(line2, LW) + "~";
+  out.push(ESC + "[" + (rows - 3) + ";1H" + padRow(line2, LW) + cc(CRIMSON, BAR));
+  SCR[rows - 3] = plainRow(line2, LW) + "\u2502";
+  // right rail edge for the composer rows ( the box's right wall doubles as the rail line )
+  out.push(ESC + "[" + (rows - 4) + ";" + (barX - 1) + "H" + cc(CRIMSON, BAR) + cc(DIM, "\u2562"));
+  SCR[rows - 4] = (SCR[rows - 4] + "").padEnd(barX - 2, " ") + "\u2502\u2562";
   const busy = UI.busy;
   const conf = UI_CONFIRM;
   const footL = conf
     ? cc(CRIMSON + BOLD, " \u26a0 sandbox \u00b7 allow: ") + cc(DIM, clip(conf.label, Math.max(30, UI.cols - PANEL_W - 44))) + cc(CRIMSON + BOLD, "  y allow") + cc(DIM, " \u00b7 n/esc " + Math.max(0, Math.ceil(((conf.dead || Date.now() + 120000) - Date.now()) / 1000)) + "s left")
     : busy
-    ? cc(CRIMSON + BOLD, " " + SPINNER_FRAMES[UI.spinner] + " " + UI.busyLabel) + cc(DIM, " " + fmtDur(Date.now() - UI.busyStart) + " \u00b7 esc interrupt")
+    ? cc(CRIMSON + BOLD, " " + SPINNER_FRAMES[UI.spinner] + " " + UI.busyLabel) + cc(DIM, " " + fmtDur(Date.now() - UI.busyStart) + (Date.now() - UI.busyStart > 12000 ? " \u00b7 still working" : "") + " \u00b7 esc interrupt")
     : " " + cc(DIM, CWD);
   let footR = busy ? (PENDING
     ? cc(CRIMSON + BOLD, " \u23f3 switching to \u201c" + clip(PENDING_NAME || "", 26) + "\u201d after this reply ")
@@ -1723,6 +1742,13 @@ function drawFrame() {
     : cc(DIM, " / commands \u00b7 enter send \u00b7 turn " + UI.turn + " \u00b7 ctx " + ctxK() + " ")));
   out.push(ESC + "[" + (rows - 2) + ";1H" + padRow(footL, barX - stripAnsi(footR).length - 1) + footR);
   SCR[rows - 2] = plainRow(footL, barX - stripAnsi(footR).length - 1) + stripAnsi(footR);
+  // -------- toast card ( notification that floats over the last body row, spinner-ticking until it fades )
+  if (UI.TOAST && UI.TOAST.until > NOW_MS && rows >= 16) {
+    const tLabel = cc(CRIMSONBG, " " + SPINNER_FRAMES[UI.spinner % SPINNER_FRAMES.length] + " ") + cc(CRIMSON + BOLD, " " + clip(UI.TOAST.text, Math.max(20, barX - 10)) + " ");
+    const tW = stripAnsi(tLabel).length;
+    out.push(ESC + "[" + (rows - 6) + ";" + Math.max(1, barX - tW - 1) + "H" + tLabel);
+    SCR[rows - 6] = (SCR[rows - 6] || "").slice(0, Math.max(0, barX - tW - 2)) + plainRow(tLabel, tW);
+  }
   // -------- input cursor LAST so the caret (only visible cursor) sits in the box
   out.push(ESC + "[" + (rows - 1) + ";1H" + padRow("", cols - 1));
   // -------- drag-selection highlight ( drawn over everything, under the cursor )
@@ -1742,8 +1768,8 @@ function drawFrame() {
       out.push(ESC + "[" + (r + 1) + ";" + (c0 + 1) + "H" + ESC + "[7m" + seg + ESC + "[27m");
     }
   }
-  const curCol = 5 + stripAnsi(UI.input).length;
-  out.push(ESC + "[" + (rows - 4) + ";" + clamp(curCol, 5, cols) + "H" + ESC + "[?25h");
+  const curCol = 6 + stripAnsi(UI.input).length;
+  out.push(ESC + "[" + (rows - 4) + ";" + clamp(curCol, 6, cols) + "H" + ESC + "[?25h");
   process.stdout.write(out.join(""));
 }
 
@@ -1900,7 +1926,12 @@ let PENDING_NAME = "";
 let SESSIONS_DIRTY = false;   // set when session files change on disk; the open dialog refreshes itself on next draw
 let PROMPT_HIST = [];
 let HIST_IDX = -1;
-const spinnerTimer = setInterval(() => { if (UI.busy) { UI.spinner = (UI.spinner + 1) % SPINNER_FRAMES.length; scheduleDraw(); } }, 120);
+const spinnerTimer = setInterval(() => {
+  const tn = Date.now();
+  if (UI.TOAST && UI.TOAST.until <= tn) UI.TOAST = null;   // toast fades itself out
+  if (UI.busy) UI.spinner = (UI.spinner + 1) % SPINNER_FRAMES.length;
+  if (UI.busy || UI.TOAST) scheduleDraw();
+}, 120);
 try { spinnerTimer.unref(); } catch { /* nop */ }
 const clockTimer = setInterval(() => { if (UI.busy) scheduleDraw(); }, 1000);
 try { clockTimer.unref(); } catch { /* nop */ }
@@ -2378,7 +2409,11 @@ function onKey(str, key) {
           if (SELECTION) {
             const sel = SELECTION; SELECTION = null;
             const txt = selectionText(sel);
-            if (txt) { copyToClipboard(txt); addLog(cc(CRIMSON + BOLD, " \u2398 copied " + txt.split("\n").length + " lines (" + txt.length + " chars) to clipboard")); }
+            if (txt) {
+              copyToClipboard(txt);
+              addLog(cc(DIM, " \u2398 copied " + txt.split("\n").length + " lines (" + txt.length + " chars) to clipboard"));
+              toast("copied " + txt.split("\n").length + " lines \u00b7 " + txt.length + " chars");
+            }
             fullDraw = true; scheduleDraw(true);
           } else if (CLICK_ROW && CLICK_ROW.inDlg) {
             const same = CLICK_ROW.r === my;
@@ -2395,7 +2430,27 @@ function onKey(str, key) {
       return;
     }
     if (!key) return;
-    if (key.ctrl && key.name === "c") { saveSession(); process.exit(0); }
+    if (key.ctrl && key.name === "a") {
+      // select-all copy: the plain-text screen snapshot goes to the clipboard in one stroke
+      const all = (SCR || []).slice(0, Math.max(1, UI.rows - 2)).join("\n").replace(/\n+$/g, "");
+      if (all.trim()) { copyToClipboard(all); toast("copied whole screen \u00b7 " + all.length + " chars"); }
+      return;
+    }
+    if (key.ctrl && key.name === "c") {
+      if (SELECTION) {
+        const sel = SELECTION; SELECTION = null;
+        const txt = selectionText(sel);
+        if (txt) { copyToClipboard(txt); toast("copied " + txt.split("\n").length + " lines \u00b7 " + txt.length + " chars"); }
+        fullDraw = true; scheduleDraw(true);
+        return;
+      }
+      if (UI.input) { setUserInput(""); toast("prompt cleared \u00b7 ctrl+c again to exit"); return; }
+      const now = Date.now();
+      if (UI.CC_TS && now - UI.CC_TS < 1600) { saveSession(); process.exit(0); }
+      UI.CC_TS = now;
+      toast("ctrl+c again to exit");
+      return;
+    }
     if (key.ctrl && key.name === "p") { UI.mode = UI.mode === "Build" ? "Plan" : "Build"; addLog(cc(DIM, " mode -> " + UI.mode)); return; }
     // ---- custom provider text capture ( name -> baseURL -> hidden api key ) wins over all modal keys
     if (CUSTOM_CAPTURE) {
@@ -2468,6 +2523,7 @@ function onKey(str, key) {
     }
     if (UI.busy) {
       if (key.name === "escape") {
+        if (SELECTION) { SELECTION = null; fullDraw = true; scheduleDraw(true); return; }   // esc first legally clears a drag selection
         if (UI.popupOpen) { closePopup(); if (UI.input.startsWith("/")) setUserInput(""); }
         else if (ABORT) { try { ABORT.abort(); } catch { /* nop */ } }
         return;
@@ -2514,6 +2570,7 @@ function onKey(str, key) {
     if (key.name === "pagedown") { nudgeScroll(-Math.max(3, Math.floor(UI.rows / 3))); return; }
     if ((key.ctrl && key.name === "v") || (key.shift && key.name === "insert")) { pasteClipboard(); return; }
     if (key.name === "escape") {
+      if (SELECTION) { SELECTION = null; fullDraw = true; scheduleDraw(true); return; }
       if (UI.popupOpen) { closePopup(); if (UI.input.startsWith("/")) setUserInput(""); }
       return;
     }
