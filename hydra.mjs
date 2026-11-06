@@ -2549,6 +2549,46 @@ function plainSession() {
         saveCfg(); console.log("skills_safe -> " + (CFG.skills_safe ? "on" : "off"));
       }
       else if (q === "/skills") { listSkillDirs().slice(0, 40).forEach((s) => console.log(s.name + (s.description ? ": " + s.description : ""))); }
+      else if (q.startsWith("/skill-del")) {
+        const slug = safeSkillName(q.replace("/skill-del", "").trim());
+        if (!slug) { console.log("/skill-del <name> - deletes a hydra skill (stashed into .trash first)"); return; }
+        const dir = path.join(CFG_DIR, "skills", slug);
+        if (!fs.existsSync(path.join(dir, "SKILL.md"))) { console.log("no hydra skill named \"" + slug + "\""); return; }
+        try {
+          fs.mkdirSync(SKILL_TRASH(), { recursive: true });
+          const stash = String(Date.now()).padStart(13, "0") + "-" + slug;
+          fs.renameSync(dir, path.join(SKILL_TRASH(), stash));
+          console.log("stashed skill \"" + slug + "\" into .trash (" + stash + ")");
+        } catch (e) { console.log("delete failed: " + (e.message || e)); }
+      }
+      else if (q.startsWith("/learn")) {
+        const src = q.replace("/learn", "").trim();
+        if (!src) { console.log("/learn <text|url|path> - turns reference material into a reusable skill (the agent distills and saves it)"); return; }
+        let material = src;
+        try {
+          if (/^https?:\/\//i.test(src)) {
+            console.log("fetching " + src);
+            material = (await webInjectLines(src)).map((l) => stripAnsi(l)).join("\n");
+          } else if (fs.existsSync(path.resolve(CWD, src)) && fs.statSync(path.resolve(CWD, src)).isFile()) {
+            material = "FILE: " + path.resolve(CWD, src) + "\n\n" + fs.readFileSync(path.resolve(CWD, src), "utf8").slice(0, 60000);
+          }
+        } catch (e) { console.log("learn source failed: " + (e.message || e)); return; }
+        const learnQ = "Turn the following material into a reusable skill. Distill it: synthesize frameworks, definitions, decision rules, steps and anti-patterns in your own words - NEVER copy long passages. Choose a kebab-case skill name matching the topic, write a one-line description, and save it with skill_write. If a skill with that name likely already exists, still do skill_write (it overwrites cleanly). Reply after saving with just the skill name and one line on when to use it.\n\n--- BEGIN MATERIAL ---\n" + material.slice(0, 50000) + "\n--- END MATERIAL ---";
+        console.log("learn: distilling into a skill");
+        await agentLoop(learnQ, activeProvider(), (t) => process.stdout.write(t), (tool) => console.log("\n  > " + tool), HISTORY, undefined, false);
+        console.log("");
+      }
+      else if (q.startsWith("/hub")) {
+        let catalog = null;
+        try {
+          const raw = await fetchText(HUB_URL, 12000);
+          const j = JSON.parse(raw.replace(/^\uFEFF/, ""));
+          catalog = (Array.isArray(j) ? j : j.skills || []).map((x) => typeof x === "string" ? { name: x, description: "" } : { name: String(x.name || ""), description: String(x.description || ""), path: String(x.path || "") }).filter((x) => x.name);
+        } catch (e) { console.log("hub fetch failed: " + (e.message || e) + " - set HYDRA_HUB_URL to override"); return; }
+        if (!catalog.length) { console.log("hub is empty right now"); return; }
+        catalog.slice(0, 40).forEach((x) => console.log((x.name || "") + (x.description ? ": " + x.description : "")));
+        console.log("install from the hub with the full-screen hydra (enter picks a row): node hydra.mjs");
+      }
       else if (q.startsWith("!")) {
         const cmd = q.slice(1).trim();
         try {
