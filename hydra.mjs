@@ -166,12 +166,27 @@ async function runToolCall(tc, signal) {
       fs.mkdirSync(path.dirname(p), { recursive: true });
       fs.writeFileSync(p, args.content ?? "", "utf8");
       result = "written " + p;
+      const bodyLines = String(args.content ?? "").split("\n").filter((l) => l.trim()).length;
+      const headLines = String(args.content ?? "").split("\n").filter(Boolean).slice(0, 2);
+      addLog(cc(DIM, " write " + shortPath(p) + " \u00b7 " + bodyLines + " lines"));
+      for (const l of headLines) addLog(cc(DIM, "   + " + clip(l, 78)));
     } else if (tc.function?.name === "edit") {
       const p = path.resolve(CWD, args.filePath);
       const src = fs.readFileSync(p, "utf8");
       if (!src.includes(args.oldString)) throw new Error("oldString not found: " + args.oldString);
       fs.writeFileSync(p, src.replace(args.oldString, args.newString ?? ""), "utf8");
       result = "edited " + p;
+      addLog(cc(DIM, " edit " + shortPath(p) + " (" + String(args.oldString || "").split("\n").length + "- \u2192 " + String(args.newString ?? "").split("\n").length + "+ lines)"));
+      for (const d of String(args.oldString || "").split("\n").slice(0, 4)) addLog(cc(DIM, "   - " + clip(d, 78)));
+      for (const s of String(args.newString ?? "").split("\n").slice(0, 4)) addLog(cc(CRIMSON, "   + " + clip(s, 78)));
+    } else if (tc.function?.name === "todo_write") {
+      const arr = Array.isArray(args.items) ? args.items.slice(0, 12) : [];
+      UI.TODOS = arr.map((x) => ({ text: String((x && x.text) || "").slice(0, 120), done: !!((x && x.done)) }));
+      const open = UI.TODOS.filter((t) => !t.done).length;
+      result = "todo list updated \u00b7 " + open + " open / " + UI.TODOS.length + " total";
+      addLog(cc(CRIMSON + BOLD, " \u2713 todos:"));
+      for (const t of UI.TODOS.slice(0, 6)) addLog(cc(t.done ? DIM : CRIMSON + BOLD, "   " + (t.done ? "\u2611" : "\u2610") + " " + clip(t.text, 78)));
+      scheduleDraw(true);
     } else if (tc.function?.name === "list") {
       result = fs.readdirSync(args.dirPath ? path.resolve(CWD, args.dirPath) : CWD, { withFileTypes: true })
         .filter((d) => !SKIP_DIRS.includes(d.name))
@@ -233,6 +248,7 @@ const TOOLS_SCHEMA = [
   { type: "function", function: { name: "skill_load", description: "Load the full body of an installed skill before doing that task.", parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] } } },
   { type: "function", function: { name: "skill_write", description: "Save a reusable workflow as a skill (SKILL.md) for future sessions. name: kebab-case slug.", parameters: { type: "object", properties: { name: { type: "string" }, description: { type: "string" }, body: { type: "string" } }, required: ["name", "description", "body"] } } },
   { type: "function", function: { name: "memory_write", description: "Persist one durable fact the user taught you (one short line).", parameters: { type: "object", properties: { content: { type: "string" } }, required: ["content"] } } },
+  { type: "function", function: { name: "todo_write", description: "Set/track your visible working checklist for multi-step work (shown in the UI). Call before starting, update as steps finish.", parameters: { type: "object", properties: { items: { type: "array", items: { type: "object", properties: { text: { type: "string" }, done: { type: "boolean" } }, required: ["text"] } } }, required: ["items"] } } },
 ];
 
 
@@ -336,10 +352,11 @@ function SYS() {
     "You are HYDRA, a coding agent inside a Windows terminal UI. Version " + VERSION + ".",
     "OS: Windows, PowerShell 5.1 (no apostrophes inside single-quoted PowerShell commands).",
     "Working directory: " + CWD + ".",
-    "You have tools: bash, read, write, edit, list, glob, grep, skill_load, skill_write, memory_write.",
+    "You have tools: bash, read, write, edit, list, glob, grep, skill_load, skill_write, memory_write, todo_write.",
     "Rules: act autonomously, do not ask questions. Prefer edit over rewrite.",
     "Use relative paths against the working directory when possible.",
     "Be concise in final answers. If a tool errors, adapt once, then answer.",
+    "For multi-step work (3+ steps), set a checklist with todo_write right away and update it after each step.",
   ];
   const skills = listSkillDirs().slice(0, 40);
   if (skills.length) {
@@ -372,6 +389,32 @@ function runToolLabel(tc) {
   if (n === "memory_write")
     return "memory write: " + clip(String(args.content || args.fact || ""), 52);
   return `${n || "?"} ${JSON.stringify(args).slice(0, 110)}`;
+}
+
+// ---- @mention attachments: "@path" tokens glue the file's contents into the message (ai-cli style)
+function inlineAttach(q) {
+  let out = String(q || ""), n = 0;
+  const seen = [];
+  for (const m of out.matchAll(/(?:^|[\s(])@([A-Za-z0-9_\-.][A-Za-z0-9_\-.\/\\~]{0,200})/g)) {
+    if (n >= 4) break;
+    const tok = "@" + m[1].trim();
+    let p = null, kb = 0;
+    try {
+      p = path.resolve(CWD, tok.slice(1).replace(/^~/, os.homedir()));   // for the FS the @ is a sigil, not path text
+      const st = fs.statSync(p);
+      if (!st.isFile() || st.size > 262144) { p = null; continue; }
+      kb = Math.max(1, Math.round(st.size / 1024));
+    } catch { continue; }
+    if (seen.includes(p)) continue;
+    seen.push(p);
+    try {
+      const c = fs.readFileSync(p, "utf8").slice(0, 24000);
+      out = out.split(tok).join("\n[attached file: " + shortPath(p) + "]\n" + c);
+      addLog(cc(DIM, " \u2398 attached: " + shortPath(p) + " (" + kb + " KB)"));
+      n++;
+    } catch { /* unreadable -> skip */ }
+  }
+  return out;
 }
 
 async function agentLoop(question, provider, ondelta, onTool, history, signal, noTools, extraSystem) {
@@ -603,6 +646,9 @@ function helpLines() {
     "",
     cc(CRIMSON + BOLD, " agent loop \u00b7 hermes-grade"),
     cc(DIM, " <skill> <task>       start a message with a skill name: its guide auto-loads"),
+    cc(DIM, " @file.md             attach a file to your message (\u22644 files \u00b7 \u2264240 KB each)"),
+    cc(DIM, " \u23f3 queueing           type + enter while a turn runs: your prompt waits, then runs"),
+    cc(DIM, " todo tool            the model keeps a visible checklist for multi-step work"),
     cc(DIM, " /skills              list installed skills (agent + opencode/claude dirs)"),
     cc(DIM, " /learn <src>         distill text/url/file into a NEW skill (agent writes it)"),
     cc(DIM, " /hub                 browse + install community skills (secret scan at install)"),
@@ -690,6 +736,8 @@ const UI = {
   anchorStart: null,   // frozen top offset of the viewport while scrolled up, so new logs do not slide the view away
   anchorScroll: null,  // scroll value at the moment the anchor was frozen (detecting new user scrolls vs new content)
   dialog: null, // { kind:"sessions", sel:0, items:[{value,name,when,turns,whenISO}], file:"", preview:[] }
+  QUEUE: [],    // typed-during-a-turn prompts, flushed at the turn's end (opencode/Claude-style queueing)
+  TODOS: [],    // the model's visible checklist (todo_write tool), {text, done}
 };
 
 function centerText(text, width) {
@@ -1119,6 +1167,8 @@ function panelTexts() {
     cc(DIM, "deep    " + (DEEP_SHELL.child ? "live" : "off")),
     cc(DIM, "memory  " + cachedCount("memory", memoryFactsCount)),
     cc(DIM, "lessons " + cachedCount("lessons", lessonCount)),
+    cc(DIM, "ctx     " + ctxK()),
+    ...(UI.TODOS.length ? [cc(UI.TODOS.some((t) => !t.done) ? CRIMSON + BOLD : DIM, "todo    " + UI.TODOS.filter((t) => !t.done).length + "/" + UI.TODOS.length)] : []),
     cc(DIM, "-".repeat(Math.max(4, W - 1))),
     cc(DIM, "say <skill>"),
     cc(DIM, "esc int"),
@@ -1127,6 +1177,16 @@ function panelTexts() {
   ];
 }
 const _COUNT_CACHE = { sessions: { v: 0, t: 0 }, skills: { v: 0, t: 0 }, mcps: { v: 0, t: 0 }, memory: { v: 0, t: 0 }, lessons: { v: 0, t: 0 } };
+// rough context-size gauge (chars/4 ≈ tokens) over the live turn history — ai-cli style "ctx" readout
+function ctxTokens() {
+  let chars = 0;
+  for (const m of HISTORY.slice(-32)) chars += String((m && m.content) || "").length;
+  return Math.round(chars / 4);
+}
+function ctxK() {
+  const tk = ctxTokens() / 1000;
+  return tk >= 1000 ? (tk / 1000).toFixed(1) + "m" : Math.round(tk) + "k";
+}
 function cachedCount(kind, fn) {
   const c = _COUNT_CACHE[kind];
   if (Date.now() - c.t > 4000) { c.v = fn(); c.t = Date.now(); }
@@ -1468,6 +1528,7 @@ function loadSessionFile(file) {
     const j = JSON.parse(raw0);
     const wasActive = String(file) === ACTIVE_SESSION_FILE;
     HISTORY = Array.isArray(j.history) ? j.history : [];
+    UI.TODOS = [];   // the checklist belongs to the previous session's work
     ACTIVE_SESSION_FILE = String(file);
     CURRENT_SESSION_TITLE = j.name || "";
     const mt = /^([0-9]{4}-[0-9]{2}-[0-9]{2}T[\d-]+Z)/.exec(String(file));
@@ -1654,9 +1715,12 @@ function drawFrame() {
     : " " + cc(DIM, CWD);
   let footR = busy ? (PENDING
     ? cc(CRIMSON + BOLD, " \u23f3 switching to \u201c" + clip(PENDING_NAME || "", 26) + "\u201d after this reply ")
-    : " ") : (UI.scroll > 0
+    : (UI.QUEUE.length ? cc(DIM, " \u23f3 " + UI.QUEUE.length + " queued \u00b7 ") : "") + cc(DIM, "esc interrupt \u00b7 ctx " + ctxK() + " "))
+    : (UI.scroll > 0
     ? cc(CRIMSON + BOLD, " \u2191 " + UI.scroll + " (pgup/pgdn ") + cc(DIM, "\u00b7 type to return ")
-    : cc(DIM, " / commands \u00b7 enter send \u00b7 turn " + UI.turn + " "));
+    : (ctxTokens() > 90000
+    ? cc(CRIMSON + BOLD, " ctx " + ctxK() + " filling \u00b7 /clear? ") + cc(DIM, "\u00b7 turn " + UI.turn + " ")
+    : cc(DIM, " / commands \u00b7 enter send \u00b7 turn " + UI.turn + " \u00b7 ctx " + ctxK() + " ")));
   out.push(ESC + "[" + (rows - 2) + ";1H" + padRow(footL, barX - stripAnsi(footR).length - 1) + footR);
   SCR[rows - 2] = plainRow(footL, barX - stripAnsi(footR).length - 1) + stripAnsi(footR);
   // -------- input cursor LAST so the caret (only visible cursor) sits in the box
@@ -2165,7 +2229,7 @@ async function submitLine() {
   PROMPT_HIST.push(q); HIST_IDX = -1;
   UI.turn++;
   addLog(cc(CRIMSON + BOLD, " \u276f ") + q);
-  await runAgentTurn(q);
+  await runAgentTurn(inlineAttach(q));
 }
 
 async function runAgentTurn(q, extraSystem) {
@@ -2212,6 +2276,7 @@ async function runAgentTurn(q, extraSystem) {
   }
   stopBusy();
   ABORT = null;
+  if (Date.now() - (UI.busyStart || 0) > 8000 && process.stdout.isTTY) { try { process.stdout.write("\u0007"); } catch { /* nop */ } }
   saveSession();
   appendLearning(q, TOOL_CALLS_TOTAL - t0, outcome.slice(0, 200));
   genSessionTitle().catch(() => { /* best-effort */ });
@@ -2220,6 +2285,12 @@ async function runAgentTurn(q, extraSystem) {
     PENDING = null; PENDING_NAME = "";
     addLog(cc(CRIMSON + BOLD, " turn finished \u00b7 applying the queued session switch \u2193"));
     loadSessionFile(f);
+    return;
+  }
+  if (UI.QUEUE.length) {
+    const nq = UI.QUEUE.shift();
+    addLog(cc(CRIMSON + BOLD, " \u25b6 running queued prompt: ") + clip(nq, 70));
+    runAgentTurn(inlineAttach(nq)).catch((e) => { addLog(cc("\u001b[31m", " " + (e.message || e))); });
   }
 }
 let running = true; void running;
@@ -2408,6 +2479,15 @@ function onKey(str, key) {
         if (UI.popupOpen && pk !== "slash" && pk !== "custom" && pk !== "model" && pk !== "provider") { popupActivate(); return; }
         if ((UI.popupOpen && !cmd) || /^(\/(sessions|resume|help|mcp|mcps?|copylast|cd|export|rename|provider|model|fork|search|theme|key|undo|regen|web|stats)\b)/.test(cmd)) {
           submitLine().catch((e) => { addLog(cc("\u001b[31m", " " + (e.message || e))); scheduleDraw(); });
+          return;
+        }
+        if (cmd && !cmd.startsWith("/")) {
+          // ai-cli style queueing: the prompt waits for the running turn and runs right after it
+          if (UI.QUEUE.length >= 12) UI.QUEUE.shift();
+          UI.QUEUE.push(cmd);
+          setUserInput("");
+          addLog(cc(DIM, " \u23f3 queued for after this reply: ") + clip(cmd, 64));
+          scheduleDraw(true);
           return;
         }
         if (!UI.busyHint) {
@@ -2631,7 +2711,7 @@ function plainSession() {
         } catch (e) { console.log("error: " + (e.message || e)); }
       }
       else {
-        await agentLoop(q, activeProvider(), (t) => { process.stdout.write(t); },
+        await agentLoop(inlineAttach(q), activeProvider(), (t) => { process.stdout.write(t); },
           (tool) => { process.stdout.write("\n  > " + tool + "\n"); }, HISTORY, undefined, UI.mode === "Plan");
         console.log("");
       }
@@ -3046,8 +3126,9 @@ async function main() {
           if (raw.includes('"role":"tool"')) res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "SAVED flyingstep" } }] }) + "\n\n");
           else if (raw.includes("fly-skill-body-v1")) res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "LOADED fly-skill-marker" } }] }) + "\n\n");
           else res.write("data: " + JSON.stringify({ choices: [{ delta: { tool_calls: [
-            { index: 0, id: "c1", type: "function", function: { name: "skill_write", arguments: JSON.stringify({ name: "flyingstep", description: "Greets loudly via the fly procedure", body: "# Fly\nStep one: greet the user looooud (fly-skill-body-v1)." }) } },
-            { index: 1, id: "c2", type: "function", function: { name: "memory_write", arguments: JSON.stringify({ content: "User prefers deep-terminal persistence between bash calls" }) } },
+            { index: 0, id: "c0", type: "function", function: { name: "todo_write", arguments: JSON.stringify({ items: [{ text: "save the flyingstep skill" }, { text: "remember deep-terminal preference", done: true }] }) } },
+            { index: 1, id: "c1", type: "function", function: { name: "skill_write", arguments: JSON.stringify({ name: "flyingstep", description: "Greets loudly via the fly procedure", body: "# Fly\nStep one: greet the user looooud (fly-skill-body-v1)." }) } },
+            { index: 2, id: "c2", type: "function", function: { name: "memory_write", arguments: JSON.stringify({ content: "User prefers deep-terminal persistence between bash calls" }) } },
           ] } }] }) + "\n\n");
           res.write("data: [DONE]\n\n");
           res.end();
@@ -3156,6 +3237,76 @@ async function main() {
     setTimeout(() => { "deepfly check".split("").forEach((c) => send(c)); }, 10600);
     setTimeout(() => send("", { name: "return" }), 11000);      // skill trigger -> DEEPFLY ON
     setTimeout(() => process.exit(0), 16500);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "18") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // ai-cli batch: queue prompts while a turn runs, @file attach, write/edit diff log
+    const httpm = await import("node:http");
+    fs.writeFileSync(path.join(CWD, "qatt.txt"), "ATTACHBODY-MARK pin robo-hydra\n", "utf8");
+    const srv = httpm.createServer((req, res) => {
+      const body = [];
+      req.on("data", (c) => body.push(c));
+      req.on("end", () => {
+        const raw = Buffer.concat(body).toString();
+        const mU = [...raw.matchAll(/\{"role":"user","content":"((?:[^"\\]|\\.)*)"\}/g)];
+        const lastU = mU.length ? mU[mU.length - 1][1] : "";
+        if (req.method === "POST" && String(req.url).includes("chat/completions")) {
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          if (raw.includes('"role":"tool"') && raw.includes('"content":"edited')) {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "EDITDONE s18" } }] }) + "\n\n");
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else if (raw.includes('"role":"tool"') && raw.includes('"content":"written')) {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "ce1", type: "function", function: { name: "edit", arguments: JSON.stringify({ filePath: "qout.txt", oldString: "line two", newString: "line two plus" }) } }] } }] }) + "\n\n");
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else if (raw.includes('"role":"tool"')) {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "TOOL-UNKNOWN s18" } }] }) + "\n\n");
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else if (lastU.includes("slow one")) {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "SLOW-TURN-ONE " } }] }) + "\n\n");
+            setTimeout(() => { res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "ended" } }] }) + "\n\n"); res.write("data: [DONE]\n\n"); res.end(); }, 2200);
+          } else if (lastU.includes("queued hello")) {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "QUEUEDTURN-OK second prompt ran" } }] }) + "\n\n");
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else if (lastU.includes("explain") && raw.includes("ATTACHBODY-MARK")) {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "ATTACHED-OK body-seen" } }] }) + "\n\n");
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else if (lastU.includes("explain")) {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "ATTACH-FAIL" } }] }) + "\n\n");
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else if (lastU.includes("qattdowrite")) {
+            res.write("data: " + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "cw1", type: "function", function: { name: "write", arguments: JSON.stringify({ filePath: "qout.txt", content: "line one\nline two\nline tree" }) } }] } }] }) + "\n\n");
+            res.write("data: [DONE]\n\n");
+            res.end();
+          } else {
+            res.write("data: [DONE]\n\n");
+            res.end();
+          }
+        } else res.end(JSON.stringify({ data: [{ id: "alpha-a" }] }));
+      });
+    });
+    await new Promise((ok) => srv.listen(7094, "127.0.0.1", ok));
+    srv.unref?.();
+    loadCfg();
+    CFG.providers["prov-live"] = { name: "prov-live", baseURL: "http://127.0.0.1:7094/v1", apiKey: "key-s18", model: "alpha-a" };
+    CFG.active = "prov-live";
+    saveCfg();
+    setTimeout(() => { "slow one please".split("").forEach((c) => send(c)); }, 1600);   // (after the ~1.5s splash so no key is eaten)
+    setTimeout(() => send("", { name: "return" }), 2000);      // turn 1 runs ~2.2s
+    setTimeout(() => { "queued hello".split("").forEach((c) => send(c)); }, 2900);
+    setTimeout(() => send("", { name: "return" }), 3200);      // busy: must queue, then run after turn 1
+    setTimeout(() => { "explain @qatt.txt now".split("").forEach((c) => send(c)); }, 8000);
+    setTimeout(() => send("", { name: "return" }), 8400);      // attach -> ATTACHED-OK body-seen
+    setTimeout(() => { "qattdowrite the file".split("").forEach((c) => send(c)); }, 13500);
+    setTimeout(() => send("", { name: "return" }), 13900);     // write + edit -> diff log + EDITDONE s18
+    setTimeout(() => process.exit(0), 21000);
     return;
   }
   if (process.env.HYDRA_TEST) {
