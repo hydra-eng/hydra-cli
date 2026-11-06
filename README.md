@@ -48,6 +48,7 @@ Inspired by the Hermes Agent's design: hydra is not just a chat shell — it lea
 - **deep terminal** — short one-line `bash` tool calls run inside a persistent hidden PowerShell child, so `cd`, env vars and venv activation persist call to call like a real working terminal; everything else uses the one-shot runner. `esc` still interrupts.
 - **write-approval gate** — `/skills-safe on` makes `skill_write` require a `y` confirmation before the model can add, change or delete a skill. Removed skills go to `skills/.trash/` (as with sessions: nothing is hard-deleted).
 - `/memory` prints the remembered set; `/skills` lists installed skills with their triggers.
+- **the UI shows the living agent loop** — the right rail rows out sandbox mode, deep-terminal state, memory facts and lessons (all live-updating), a handler badge appears when the sandbox runs non-default, `/stats` reports the agent-loop state, and boot announces "agent loop ready · N skills installed · say <skill> <task>".
 
 ## 👼 palettes
 

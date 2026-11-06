@@ -364,7 +364,14 @@ function SYS() {
 function runToolLabel(tc) {
   let args = {};
   try { args = JSON.parse(tc.function?.arguments || "{}"); } catch { /* nop */ }
-  return `${tc.function?.name || "?"} ${JSON.stringify(args).slice(0, 110)}`;
+  const n = tc.function?.name;
+  if (n === "skill_load")
+    return "skill load: " + clip(String(args.name || ""), 60);
+  if (n === "skill_write")
+    return "skill write: " + clip(String(args.name || ""), 60);
+  if (n === "memory_write")
+    return "memory write: " + clip(String(args.content || args.fact || ""), 52);
+  return `${n || "?"} ${JSON.stringify(args).slice(0, 110)}`;
 }
 
 async function agentLoop(question, provider, ondelta, onTool, history, signal, noTools, extraSystem) {
@@ -593,13 +600,17 @@ function helpLines() {
     cc(DIM, " /web <url>           fetch a web page into the conversation context"),
     cc(DIM, " /stats               turns \u00b7 approx tokens \u00b7 session/model/provider info"),
     cc(DIM, " /copylast            copy last reply to clipboard"),
-    cc(DIM, " /skills              inject a skill \u00b7 skills can also be called by name: <skill> <task>"),
+    "",
+    cc(CRIMSON + BOLD, " agent loop \u00b7 hermes-grade"),
+    cc(DIM, " <skill> <task>       start a message with a skill name: its guide auto-loads"),
+    cc(DIM, " /skills              list installed skills (agent + opencode/claude dirs)"),
     cc(DIM, " /learn <src>         distill text/url/file into a NEW skill (agent writes it)"),
-    cc(DIM, " /hub                 browse + install community skills (scanned for secrets)"),
+    cc(DIM, " /hub                 browse + install community skills (secret scan at install)"),
     cc(DIM, " /memory              show what the agent remembered \u00b7 /memory clear wipes it"),
     cc(DIM, " /sandbox ask|strict|open  gate risky commands behind y/n (default ask)"),
     cc(DIM, " /skills-safe on|off  require your approval for agent skill writes"),
     cc(DIM, " /skill-del <name>    stash a hydra skill (u-restorable pattern in .trash)"),
+    "",
     cc(DIM, " /mcp                 list configured mcp servers"),
     cc(DIM, " /clear               reset conversation + screen"),
     cc(DIM, " /exit                quit"),
@@ -972,6 +983,7 @@ function statsLines() {
     cc(DIM, " approx tokens: ") + cc(CRIMSON + BOLD, "~" + Math.round(chars / 4)) + cc(DIM, " (" + chars + " chars)"),
     cc(DIM, " session: ") + (ACTIVE_SESSION_FILE || cc(DIM, "not saved yet")) + cc(DIM, " \u00b7 cwd: " + shortPath(CWD)),
     cc(DIM, " model: ") + cc(CRIMSON + BOLD, p.model) + cc(DIM, " \u00b7 provider: " + p.name + " \u00b7 palette: " + activeTheme() + " \u00b7 mode: " + UI.mode),
+    cc(DIM, " agent loop: ") + cc(CRIMSON + BOLD, skillsCount() + " skills") + cc(DIM, " \u00b7 " + readMemoryLines(200).length + " memory facts \u00b7 " + readLessons(999).length + " lessons \u00b7 sandbox " + SANDBOX_MODE() + (DEEP_SHELL.child ? " \u00b7 deep terminal live" : "")),
   ];
 }
 function popupActivate() {
@@ -1103,17 +1115,25 @@ function panelTexts() {
     cc(DIM, "skills   " + cachedCount("skills", skillsCount)),
     cc(DIM, "mcps     " + cachedCount("mcps", mcpCount)),
     cc(DIM, "-".repeat(Math.max(4, W - 1))),
+    cc(DIM, "sandbox " + SANDBOX_MODE()),
+    cc(DIM, "deep    " + (DEEP_SHELL.child ? "live" : "off")),
+    cc(DIM, "memory  " + cachedCount("memory", memoryFactsCount)),
+    cc(DIM, "lessons " + cachedCount("lessons", lessonCount)),
+    cc(DIM, "-".repeat(Math.max(4, W - 1))),
+    cc(DIM, "say <skill>"),
     cc(DIM, "esc int"),
     cc(DIM, "tab b/p" ),
     cc(DIM, "/ cmds" ),
   ];
 }
-const _COUNT_CACHE = { sessions: { v: 0, t: 0 }, skills: { v: 0, t: 0 }, mcps: { v: 0, t: 0 } };
+const _COUNT_CACHE = { sessions: { v: 0, t: 0 }, skills: { v: 0, t: 0 }, mcps: { v: 0, t: 0 }, memory: { v: 0, t: 0 }, lessons: { v: 0, t: 0 } };
 function cachedCount(kind, fn) {
   const c = _COUNT_CACHE[kind];
   if (Date.now() - c.t > 4000) { c.v = fn(); c.t = Date.now(); }
   return c.v;
 }
+function memoryFactsCount() { return readMemoryLines(200).length; }
+function lessonCount() { return readLessons(999).length; }
 
 function sessionsDir() { return path.join(CFG_DIR, "sessions"); }
 function sessionCount() {
@@ -1253,10 +1273,13 @@ function askUserConfirm(label, ms) {
   if (!process.stdout.isTTY) return Promise.resolve(false);           // headless/scripts: refuse destructive by default
   if (mode !== "ask" && mode !== "strict") return Promise.resolve(true);
   return new Promise((resolve) => {
-    const to = setTimeout(() => { if (UI_CONFIRM && UI_CONFIRM._resolve === resolve) { UI_CONFIRM = null; scheduleDraw(true); addLog(cc(DIM, " sandbox confirm timed out \u00b7 treated as no")); resolve(false); } }, ms || 120000);
-    UI_CONFIRM = { label, resolve: (v) => { clearTimeout(to); UI_CONFIRM = null; resolve(v); } };
+    const total = ms || 120000;
+    const to = setTimeout(() => { if (UI_CONFIRM && UI_CONFIRM._resolve === resolve) { try { UI_CONFIRM._tick?.unref && clearInterval(UI_CONFIRM._tick); } catch { /* nop */ } UI_CONFIRM = null; scheduleDraw(true); addLog(cc(DIM, " sandbox confirm timed out \u00b7 treated as no")); resolve(false); } }, total);
+    UI_CONFIRM = { label, dead: Date.now() + total, resolve: (v) => { clearTimeout(to); try { clearInterval(UI_CONFIRM._tick); } catch { /* nop */ } UI_CONFIRM = null; resolve(v); } };
     UI_CONFIRM._resolve = resolve;
-    addLog(cc(CRIMSON + BOLD, " sandbox \u00b7 allow? ") + clip(label, Math.max(40, UI.cols - PANEL_W - 20)) + cc(DIM, "  y allow \u00b7 n/esc block"));
+    UI_CONFIRM._tick = setInterval(() => { if (UI_CONFIRM) scheduleDraw(); }, 1000);
+    try { UI_CONFIRM._tick.unref(); } catch { /* nop */ }
+    addLog(cc(CRIMSON + BOLD, " sandbox risk \u00b7 allow? ") + clip(label, Math.max(40, UI.cols - PANEL_W - 24)) + cc(DIM, "  y allow \u00b7 n/esc block \u00b7 auto-no in " + Math.round(total / 1000) + "s"));
     scheduleDraw(true);
   });
 }
@@ -1522,7 +1545,8 @@ function drawFrame() {
   const head = cc(CRIMSONBG, " HYDRA ") + cc(CRIMSON + BOLD, " v" + VERSION + " ")
     + cc(DIM, "\u2502 provider ") + cc(CRIMSON, p0.name)
     + cc(DIM, "\u2502 model ") + cc(CRIMSON, clip(p0.model, Math.max(20, LW - 30)))
-    + cc(DIM, "\u2502 mode ") + cc(CRIMSON + BOLD, UI.mode);
+    + cc(DIM, "\u2502 mode ") + cc(CRIMSON + BOLD, UI.mode)
+    + (SANDBOX_MODE() !== "ask" ? cc(DIM, "\u2502 ") + cc(CRIMSON + BOLD, " sandbox " + SANDBOX_MODE()) : "");
   out.push(ESC + "[1;1H" + padRow(head, cols - 1));
   SCR[0] = plainRow(head, cols - 1);
   // -------- body: scrollback window ( brand head scrolls up with chat )
@@ -1624,7 +1648,7 @@ function drawFrame() {
   const busy = UI.busy;
   const conf = UI_CONFIRM;
   const footL = conf
-    ? cc(CRIMSON + BOLD, " \u26a0 sandbox \u00b7 allow: ") + cc(DIM, clip(conf.label, Math.max(30, UI.cols - PANEL_W - 44))) + cc(CRIMSON + BOLD, "  y allow") + cc(DIM, " \u00b7 n/esc block")
+    ? cc(CRIMSON + BOLD, " \u26a0 sandbox \u00b7 allow: ") + cc(DIM, clip(conf.label, Math.max(30, UI.cols - PANEL_W - 44))) + cc(CRIMSON + BOLD, "  y allow") + cc(DIM, " \u00b7 n/esc " + Math.max(0, Math.ceil(((conf.dead || Date.now() + 120000) - Date.now()) / 1000)) + "s left")
     : busy
     ? cc(CRIMSON + BOLD, " " + SPINNER_FRAMES[UI.spinner] + " " + UI.busyLabel) + cc(DIM, " " + fmtDur(Date.now() - UI.busyStart) + " \u00b7 esc interrupt")
     : " " + cc(DIM, CWD);
@@ -1949,7 +1973,7 @@ async function submitLine() {
   if (q === "/skills") {
     const s = listSkillDirs();
     if (!s.length) { addLog(cc(DIM, " no skills found in " + skillDirsLL().join(" ") + " \u00b7 say \u201ccreate a skill \u2026\u201d and hydra writes one itself")); return; }
-    openPopup("skills \u2502 enter injects", s.slice(0, 40).map((x, i) => ({ label: x.name, desc: " " + (x.description || "inject the full body"), value: i })));
+    openPopup("skills \u2502 " + s.length + " installed \u2502 enter injects", s.slice(0, 40).map((x, i) => ({ label: x.name, desc: " " + (x.description || "inject the full body"), value: i })));
     return;
   }
   if (q.startsWith("/skill-del ")) {
@@ -2025,7 +2049,7 @@ async function submitLine() {
     }
     if (!catalog.length) { addLog(cc(DIM, " hub is empty right now")); return; }
     HUB_CATALOG = catalog;
-    openPopup("hub \u2502 enter installs \u00b7 " + catalog.length + " in catalog", catalog.slice(0, 40).map((x, i) => ({ label: x.name, desc: " " + (x.description || "install from the hub"), value: i })));
+    openPopup("hub \u2502 " + catalog.length + " in catalog \u2502 enter installs \u00b7 secret scan at install", catalog.slice(0, 40).map((x, i) => ({ label: x.name, desc: " " + (x.description || "install from the hub"), value: i })));
     return;
   }
   if (q === "/mcp") {
@@ -2154,7 +2178,7 @@ async function runAgentTurn(q, extraSystem) {
       const body = readSkillBody(first, 8000);
       if (body) {
         extraSystem = "[skill guide: " + first + " \u00b7 loaded automatically because the user asked by name]\n" + body;
-        addLog(cc(DIM, " skill \u201c" + first + "\u201d loaded automatically"));
+        addLog(cc(CRIMSON + BOLD, " \u2726 skill guide: ") + first + cc(DIM, " \u00b7 loaded automatically by name"));
       }
     }
   }
@@ -2549,6 +2573,12 @@ function plainSession() {
         saveCfg(); console.log("skills_safe -> " + (CFG.skills_safe ? "on" : "off"));
       }
       else if (q === "/skills") { listSkillDirs().slice(0, 40).forEach((s) => console.log(s.name + (s.description ? ": " + s.description : ""))); }
+      else if (q === "/stats") { statsLines().forEach((l) => console.log(stripAnsi(l))); }
+      else if (q.startsWith("/theme")) {
+        const arg = q.replace("/theme", "").trim();
+        if (applyTheme(arg || activeTheme())) { CFG.theme = arg || activeTheme(); saveCfg(); console.log("palette -> " + (arg || activeTheme())); }
+        else console.log("palettes: " + Object.keys(THEMES).join(" "));
+      }
       else if (q.startsWith("/skill-del")) {
         const slug = safeSkillName(q.replace("/skill-del", "").trim());
         if (!slug) { console.log("/skill-del <name> - deletes a hydra skill (stashed into .trash first)"); return; }
@@ -2626,6 +2656,7 @@ function bootLog() {
   if (BOOTED) return;
   BOOTED = true;
   if (RESTORED) addLog(cc(DIM, centerText("continued last session \u00b7 " + RESTORED + " messages restored", UI.cols - 2)));
+  addLog(cc(DIM, centerText("\u2726 agent loop ready \u00b7 " + skillsCount() + " skills installed \u00b7 say <skill> <task> \u00b7 /learn /hub /memory", UI.cols - 2)));
 }
 
 
