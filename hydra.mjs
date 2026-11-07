@@ -85,6 +85,132 @@ function ansiSplit(text, keep) {
 }
 
 // ------------------------------------------------------------
+//  markdown → ANSI for the chat log: real tables drawn with box rules,
+//  headings, lists, code fences and inline **bold** *italic* `code` links
+// ------------------------------------------------------------
+const ITAL = ESC + "[3m";
+const STRIKE = ESC + "[9m";
+
+function mdInline(s) {
+  const segs = String(s).split("`");
+  let out = "";
+  for (let i = 0; i < segs.length; i++) {
+    if (i % 2 === 1) { out += segs[i] ? cc(CRIMSON, segs[i]) : "`"; continue; }
+    let seg = segs[i];
+    seg = seg.replace(/\[([^\]\n]{1,160})\]\((https?:[^)\s]{1,300})\)/g, (m, label) => cc(CRIMSON, label) + cc(DIM, "\u21a6"));
+    seg = seg.replace(/\*\*([^*\n]{1,400}?)\*\*/g, (m, x) => cc(BOLD, x));
+    seg = seg.replace(/__([^_\n]{1,400}?)__/g, (m, x) => cc(BOLD, x));
+    seg = seg.replace(/~~([^~\n]{1,300}?)~~/g, (m, x) => cc(STRIKE, x));
+    seg = seg.replace(/(^|\s)\*([^*\n]{1,300}?)\*(?=$|\s|[.,!?:;)\]])/g, (m, pre, x) => pre + cc(ITAL, x));
+    seg = seg.replace(/(^|\s)_([^_\n]{1,300}?)_(?=$|\s|[.,!?:;)\]])/g, (m, pre, x) => /^\s*$|^\w+$/.test(x) ? m : pre + cc(ITAL, x));
+    out += seg;
+  }
+  return out;
+}
+
+const padVis = (s, w) => { const n = stripAnsi(s).length; return n >= w ? s : s + " ".repeat(w - n); };
+
+function mdTable(block, W) {
+  if (block.length < 2) return null;
+  const parsed = [];
+  for (const l of block) {
+    const t = String(l).trim();
+    if (/^\s*```/.test(t)) return null;
+    if (!t.includes("|")) return null;
+    if (/^\s*\|?[\s:|-]+\|?\s*$/.test(t) && t.includes("-")) { parsed.push(null); continue; }
+    const parts = t.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|").map((c) => c.trim());
+    if (parts.length < 2 || parts.length > 8) return null;
+    parsed.push(parts);
+  }
+  if (!parsed[0]) return null;
+  if (parsed[1] !== null) return null;             // need the classic header + separator shape
+  const body = parsed.slice(2);
+  if (body.some((r) => r === null)) return null;   // a second separator inside -> not a clean table
+  const NC = parsed[0].length;
+  for (const r of body) if (r.length > NC) return null;
+  const all = [parsed[0], ...body];
+  const colW = [];
+  for (let c = 0; c < NC; c++) {
+    let w = 4;
+    for (const r of all) w = Math.max(w, stripAnsi(mdInline(r[c] ?? "")).length);
+    colW.push(w);
+  }
+  const fixed = 3 + 3 * NC;   // indent + leading border + each cell's " sep " + trailing border
+  let budget = Math.max(10, W - fixed);
+  while (colW.reduce((a, b) => a + b, 0) > budget) {
+    let mi = 0;
+    for (let c = 1; c < NC; c++) if (colW[c] > colW[mi]) mi = c;
+    if (colW[mi] <= 8) break;
+    colW[mi]--;
+  }
+  if (colW.reduce((a, b) => a + b, 0) > budget) return null;   // still too wide -> leave raw
+  const wrapCell = (cell, w) => {
+    const ls = wrapText(mdInline(String(cell ?? "")), w).map((s) => s.replace(/\s+$/, ""));
+    return ls.length ? ls : [""];
+  };
+  const grid = all.map((r) => {
+    const arr = [];
+    for (let c = 0; c < NC; c++) arr.push(wrapCell(r[c] ?? "", colW[c]));
+    return arr;
+  });
+  const rule = (L, M, R) => cc(DIM, "  " + L + colW.map((w) => "\u2500".repeat(w + 2)).join(M) + R);
+  const out = [];
+  out.push(rule("\u250c", "\u252c", "\u2510"));
+  grid.forEach((row, ri) => {
+    const head = ri === 0;
+    const subMax = Math.max(1, ...row.map((a) => a.length));
+    for (let s = 0; s < subMax; s++) {
+      let ln = "  " + cc(DIM, "\u2502");
+      row.forEach((arr, c) => {
+        const v = arr[s] ?? "";
+        const cell = head && s === 0 ? cc(CRIMSON + BOLD, v) : v;
+        ln += " " + padVis(cell, colW[c]) + " " + cc(DIM, "\u2502");
+      });
+      out.push(ln);
+    }
+    if (head) out.push(rule("\u251c", "\u253c", "\u2524"));
+  });
+  out.push(rule("\u2514", "\u2534", "\u2518"));
+  return out;
+}
+
+function mdRender(text, width) {
+  const W = Math.max(24, width | 0);
+  const lines = String(text).split("\n");
+  const out = [];
+  let i = 0, fence = false;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (fence) {
+      if (/^\s*```/.test(line)) { fence = false; out.push(cc(DIM, "  \u2570\u2500\u2500")); i++; continue; }
+      out.push(cc(DIM, "  \u2502 ") + line);
+      i++; continue;
+    }
+    if (/^\s*```/.test(line)) { fence = true; out.push(cc(DIM, "  \u250c\u2500\u2500 code")); i++; continue; }
+    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && lines[i + 1].includes("|")
+      && /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(lines[i + 1])) {
+      const blk = [];
+      let j = i;
+      while (j < lines.length && lines[j].includes("|") && lines[j].trim() !== "" && !/^\s*```/.test(lines[j])) { blk.push(lines[j]); j++; }
+      const rendered = mdTable(blk, W);
+      if (rendered) { out.push(...rendered); i = j; continue; }
+    }
+    const hm = /^\s*(#{1,6})\s+(.*?)\s*$/.exec(line);
+    if (hm) { out.push(cc(hm[1].length <= 2 ? CRIMSON + BOLD : CRIMSON, mdInline(hm[2]))); i++; continue; }
+    if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { out.push(cc(DIM, "\u2500".repeat(Math.min(W, 48)))); i++; continue; }
+    const bm = /^(\s*)[-*]\s+(.*)$/.exec(line);
+    if (bm) { out.push(cc(CRIMSON + BOLD, bm[1] + "\u2022 ") + mdInline(bm[2])); i++; continue; }
+    const nm = /^(\s*)(\d{1,3})[.)]\s+(.*)$/.exec(line);
+    if (nm) { out.push(cc(CRIMSON + BOLD, nm[1] + nm[2] + ". ") + mdInline(nm[3])); i++; continue; }
+    const qm = /^\s*>\s?(.*)$/.exec(line);
+    if (qm) { out.push(cc(DIM, "\u258f ") + cc(DIM, mdInline(qm[1]))); i++; continue; }
+    out.push(mdInline(line));
+    i++;
+  }
+  return out.join("\n");
+}
+
+// ------------------------------------------------------------
 //  config  ( C:\Users\Acer\.hydra\config.json )
 // ------------------------------------------------------------
 const CFG_DIR = process.env.HYDRA_CFG_DIR ? path.resolve(process.env.HYDRA_CFG_DIR) : path.join(os.homedir(), ".hydra");
@@ -279,9 +405,21 @@ const TOOLS_SCHEMA = [
 const MODEL_TIMEOUT = Math.max(5000, Number(process.env.HYDRA_MODEL_TIMEOUT) || 180000);
 const withTimeout = (signal, ms) => AbortSignal.any([signal, AbortSignal.timeout(ms)].filter(Boolean));
 // never stars the stream: re-armed on every chunk inside chatOnce (TTFB + each decode window)
+// 0 = never stop: the stream claims silence-forever without aborting, esc stays the only interrupt.
+// auto never-stop for the ollama/LAN family (11434, ollama, qwen) — local models stream slowly and
+// think long between tokens; killing their replies beats the point. Set [provider].neverStop=true in
+// config.json to opt any other provider in; envs still win for test rigs.
 const MODEL_IDLE = Math.max(5000,
   Number(process.env.HYDRA_MODEL_IDLE)
   || (Number(process.env.HYDRA_MODEL_TIMEOUT) ? Math.min(Number(process.env.HYDRA_MODEL_TIMEOUT), MODEL_TIMEOUT) : 90000));
+function chatIdleMs(provider) {
+  if (process.env.HYDRA_MODEL_IDLE) return Math.max(5000, Number(process.env.HYDRA_MODEL_IDLE) || 90000);
+  if (process.env.HYDRA_MODEL_TIMEOUT) return Math.min(Number(process.env.HYDRA_MODEL_TIMEOUT), MODEL_TIMEOUT);
+  if (provider && provider.neverStop === true) return 0;
+  const hay = String((provider && provider.baseURL) || "") + " " + String((provider && provider.model) || "");
+  if (/11434|ollama|qwen/i.test(hay)) return 0;
+  return MODEL_IDLE;
+}
 const TOOL_TIMEOUT = Math.max(15000, Number(process.env.HYDRA_TOOL_TIMEOUT) || 300000);
 
 function runShellAsync(command, cwd, timeoutMs, signal) {
@@ -323,12 +461,14 @@ async function chatOnce(messages, provider, ondelta, signal, noTools) {
   const ctl = new AbortController();
   let idleT = null;
   let idleErr = null;
+  const IDLE_MS = chatIdleMs(provider);
   const armIdle = () => {
+    if (!IDLE_MS) return;   // never-stop provider: no pause window at all, the reply stays alive until it finishes or esc
     try { if (idleT) clearTimeout(idleT); } catch { /* nop */ }
     idleT = setTimeout(() => {
-      idleErr = new Error("model timed out \u00b7 " + Math.round(MODEL_IDLE / 1000) + "s with no stream data");
+      idleErr = new Error("model timed out \u00b7 " + Math.round(IDLE_MS / 1000) + "s with no stream data");
       try { ctl.abort(idleErr); } catch { /* nop */ }
-    }, MODEL_IDLE);
+    }, IDLE_MS);
   };
   const onOuter = () => { try { ctl.abort(); } catch { /* nop */ } };
   if (signal) { if (signal.aborted) onOuter(); else signal.addEventListener("abort", onOuter, { once: true }); }
@@ -1636,7 +1776,7 @@ function drawFrame() {
   const NOW_MS = Date.now();
   // -------- compose chat log flat lines into the same scrollback
   for (const e of UI.log) {
-    if (!e.cache || e.cacheW !== LW) { e.cache = wrapText(e.text, LW - 1); e.cacheW = LW; }
+    if (!e.cache || e.cacheW !== LW) { e.cache = wrapText(mdRender(e.text, LW - 1), LW - 1); e.cacheW = LW; }
     const fresh = NOW_MS - (e.t || 0) < 1500;   // brand-new rows leak in bright for a beat, then settle (log flash-in)
     if (fresh) e.cache.forEach((l, ix) => scroll.push(ix === 0 ? cc(CRIMSON + BOLD, "\u258e ") + l : l));
     else for (const l of e.cache) scroll.push(l);
@@ -2348,7 +2488,11 @@ async function runAgentTurn(q, extraSystem) {
     }, HISTORY, ABORT.signal, plan, extraSystem);
     if (plan) addLog(cc(DIM, "  (plan mode - no tools were run)"));
     if (!streamed.trim() && ABORT.signal.aborted) { addLog(cc(DIM, " interrupted")); outcome = "interrupted"; }
-    else if (streamed.trim()) { outcome = "replied " + stripAnsi(streamed).length + " chars"; addLog(cc(DIM, "  \u23f1 " + fmtDur(Date.now() - UI.busyStart) + " \u00b7 " + stripAnsi(streamed).length + " chars \u00b7 turn done")); }
+    else if (streamed.trim()) {
+      outcome = "replied " + stripAnsi(streamed).length + " chars";
+      if (curLog) { curLog.text = streamed; curLog.cache = null; }   // fold the real markdown source back in: the drawer renders tables/headers/bold from it
+      addLog(cc(DIM, "  \u23f1 " + fmtDur(Date.now() - UI.busyStart) + " \u00b7 " + stripAnsi(streamed).length + " chars \u00b7 turn done"));
+    }
   } catch (e) {
     const timedOut = e.name === "TimeoutError" || /timed out|aborted due to timeout/.test(e.message || "");
     outcome = e.name === "AbortError" ? "interrupted" : timedOut ? "model timed out" : "turn error";
