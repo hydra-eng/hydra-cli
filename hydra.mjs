@@ -46,26 +46,42 @@ const cc = (style, text) => (style ? style + text + RESET : text);
 const stripAnsi = (s) => s.replace(ANSI_RX, "");
 const clamp = (n, a, b) => (n < a ? a : n > b ? b : n);
 
-function wrapText(text, width) {
+function wrapText(text, width, overhang) {
   if (width < 8) return [String(text)];
+  const ow = Math.max(0, overhang || 0);
   const out = [];
   for (const raw of String(text).split("\n")) {
     if (raw === "") { out.push(""); continue; }
-    let line = "";
+    let line = "", budget = width - ow;
     for (const word of raw.split(" ")) {
       if (line === "") { line = word; }
-      else if (stripAnsi(line + " " + word).length <= width) { line += " " + word; }
-      else { out.push(line); line = word; }
+      else if (stripAnsi(line + " " + word).length <= budget) { line += " " + word; }
+      else { out.push(line); line = word; budget = width; }
       while (stripAnsi(line).length > width) {
-        const cut = line.slice(0, Math.max(width - 1, 1));
-        out.push(cut);
-        line = line.slice(cut.length);
+        const hunk = ansiSplit(line, Math.max(width - 1, 1));
+        out.push(hunk[0]);
+        line = hunk[1];
         if (line.startsWith(" ")) line = line.slice(1);
       }
     }
     out.push(line);
   }
   return out;
+}
+// ansi-aware split: [preview with the first `keep` visible chars, rest]; styles never bleed or get mangled
+function ansiSplit(text, keep) {
+  let shown = 0, pre = "", post = "", sepd = false;
+  for (let i = 0; i < text.length; ) {
+    if (text.startsWith(ESC + "[", i)) {
+      const m = /^\u001b\[[0-9;]*[A-Za-z]/.exec(text.slice(i));
+      if (m) { if (sepd) post += m[0]; else pre += m[0]; i += m[0].length; continue; }
+    }
+    if (!sepd && shown >= keep) { sepd = true; post += (pre.includes(ESC) && !pre.endsWith(RESET) ? RESET : ""); }
+    if (sepd) post += text[i];
+    else { pre += text[i]; shown++; }
+    i++;
+  }
+  return [pre, post];
 }
 
 // ------------------------------------------------------------
@@ -673,7 +689,7 @@ function helpLines() {
 //  TUI v2.1  ( logo center, slim right panel, composer box )
 // ------------------------------------------------------------
 const POPUP_RESERVE = 7;
-const PANEL_W = 14;
+const PANEL_W = 22;
 const _inner = 28;
 const _t2 = "\u2b22  H  Y  D  R  A  \u2b22"; // 19 cells
 const _t3 = "h y d r a  \u00b7  c l i";   // 19 cells
@@ -750,7 +766,7 @@ function centerText(text, width) {
 }
 function padRow(text, width) {
   const plain = stripAnsi(text);
-  if (plain.length > width) return plain.slice(0, width);
+  if (plain.length > width) return ansiSplit(text, width)[0];
   return text + " ".repeat(width - plain.length);
 }
 function clip(s, n) { const p = stripAnsi(s); return p.length > n ? p.slice(0, Math.max(n - 1, 0)) + "\u2026" : p; }
@@ -1173,7 +1189,11 @@ function panelTexts() {
     cc(DIM, "memory  " + cachedCount("memory", memoryFactsCount)),
     cc(DIM, "lessons " + cachedCount("lessons", lessonCount)),
     cc(DIM, "ctx     " + ctxK()),
-    ...(UI.TODOS.length ? [cc(UI.TODOS.some((t) => !t.done) ? CRIMSON + BOLD : DIM, "todo    " + UI.TODOS.filter((t) => !t.done).length + "/" + UI.TODOS.length)] : []),
+    ...(UI.TODOS.length ? [
+      cc(UI.TODOS.some((t) => !t.done) ? CRIMSON + BOLD : DIM, "todo    " + UI.TODOS.filter((t) => !t.done).length + "/" + UI.TODOS.length),
+      // opencode-style checklist on the rail: pending bold, the first open one is the current task, done dims out
+      ...UI.TODOS.slice(0, 12).map((t) => cc(t.done ? DIM : (UI.TODOS.findIndex((x) => !x.done) === UI.TODOS.indexOf(t) ? CRIMSON + BOLD : CRIMSON), (t.done ? "\u2611 " : "\u2610 ") + clip(t.text, PANEL_W - 5))),
+    ] : []),
     cc(DIM, "-".repeat(Math.max(4, W - 1))),
     cc(DIM, "say <skill>"),
     cc(DIM, "esc int"),
@@ -1710,20 +1730,24 @@ function drawFrame() {
   {
     const qN = UI.QUEUE.length;
     const bTitle = qN ? " \u276f queue " + qN + " " : " \u276f new turn ";
-    const boxIn = Math.max(8, barX - 5);
-    const top = cc(CRIMSON, "\u256D\u2500") + cc(CRIMSON + BOLD, bTitle) + cc(CRIMSON, "\u2500".repeat(Math.max(6, boxIn - stripAnsi(bTitle).length)) + "\u256E");
-    out.push(ESC + "[" + (rows - 5) + ";1H" + ESC + "[K" + top);
-    SCR[rows - 5] = plainRow(top, barX - 1);
+    // the border cap lands exactly on the wall column (barX-1) so the box and the rail line up
+    const dashN = Math.max(6, barX - 4 - stripAnsi(bTitle).length);
+    const top = cc(CRIMSON, "\u256D\u2500") + cc(CRIMSON + BOLD, bTitle) + cc(CRIMSON, "\u2500".repeat(dashN) + "\u256E");
+    out.push(ESC + "[" + (rows - 5) + ";1H" + ESC + "[K" + top + cc(DIM, "\u2562") + padRow("", PANEL_W));
+    SCR[rows - 5] = plainRow(top, barX - 1) + "\u2562";
   }
   const BAR = "\u2502";
-  out.push(ESC + "[" + (rows - 4) + ";1H" + ESC + "[K" + BAR + " \u276f " + UI.input);
-  SCR[rows - 4] = "\u2502 \u276f " + UI.input;
+  const inW = Math.max(0, barX - 8);
+  const ip = stripAnsi(UI.input);
+  const vis = ip.length > inW ? "\u2026" + ip.slice(-inW) : ip;
+  out.push(ESC + "[" + (rows - 4) + ";1H" + ESC + "[K" + BAR + " \u276f " + vis);
+  SCR[rows - 4] = BAR + " \u276f " + vis;
   const modelShort = clip(p0.model, Math.max(14, LW - 34));
-  const line2 = BAR + " " + cc(CRIMSON + BOLD, " " + UI.mode) + cc(DIM, " \u00b7 ") + cc(CRIMSON, modelShort) + (p0.apiKey ? "" : cc(DIM, "  (local)"));
-  out.push(ESC + "[" + (rows - 3) + ";1H" + padRow(line2, LW) + cc(CRIMSON, BAR));
-  SCR[rows - 3] = plainRow(line2, LW) + "\u2502";
+  const line2 = BAR + " " + cc(CRIMSON + BOLD, UI.mode) + cc(DIM, " \u00b7 ") + cc(CRIMSON, modelShort) + (p0.apiKey ? "" : cc(DIM, "  (local)"));
+  out.push(ESC + "[" + (rows - 3) + ";1H" + padRow(line2, barX - 2) + cc(CRIMSON, BAR) + cc(DIM, "\u2562") + padRow("", PANEL_W));
+  SCR[rows - 3] = plainRow(line2, barX - 2) + "\u2502\u2562";
   // right rail edge for the composer rows ( the box's right wall doubles as the rail line )
-  out.push(ESC + "[" + (rows - 4) + ";" + (barX - 1) + "H" + cc(CRIMSON, BAR) + cc(DIM, "\u2562"));
+  out.push(ESC + "[" + (rows - 4) + ";" + (barX - 1) + "H" + cc(CRIMSON, BAR) + cc(DIM, "\u2562") + padRow("", PANEL_W));
   SCR[rows - 4] = (SCR[rows - 4] + "").padEnd(barX - 2, " ") + "\u2502\u2562";
   const busy = UI.busy;
   const conf = UI_CONFIRM;
@@ -1740,8 +1764,8 @@ function drawFrame() {
     : (ctxTokens() > 90000
     ? cc(CRIMSON + BOLD, " ctx " + ctxK() + " filling \u00b7 /clear? ") + cc(DIM, "\u00b7 turn " + UI.turn + " ")
     : cc(DIM, " / commands \u00b7 enter send \u00b7 turn " + UI.turn + " \u00b7 ctx " + ctxK() + " ")));
-  out.push(ESC + "[" + (rows - 2) + ";1H" + padRow(footL, barX - stripAnsi(footR).length - 1) + footR);
-  SCR[rows - 2] = plainRow(footL, barX - stripAnsi(footR).length - 1) + stripAnsi(footR);
+  out.push(ESC + "[" + (rows - 2) + ";1H" + padRow(footL, barX - stripAnsi(footR).length - 1) + footR + cc(DIM, "\u2562") + padRow("", PANEL_W));
+  SCR[rows - 2] = plainRow(footL, barX - stripAnsi(footR).length - 1) + stripAnsi(footR) + "\u2562";
   // -------- toast card ( notification that floats over the last body row, spinner-ticking until it fades )
   if (UI.TOAST && UI.TOAST.until > NOW_MS && rows >= 16) {
     const tLabel = cc(CRIMSONBG, " " + SPINNER_FRAMES[UI.spinner % SPINNER_FRAMES.length] + " ") + cc(CRIMSON + BOLD, " " + clip(UI.TOAST.text, Math.max(20, barX - 10)) + " ");
@@ -1768,8 +1792,8 @@ function drawFrame() {
       out.push(ESC + "[" + (r + 1) + ";" + (c0 + 1) + "H" + ESC + "[7m" + seg + ESC + "[27m");
     }
   }
-  const curCol = 6 + stripAnsi(UI.input).length;
-  out.push(ESC + "[" + (rows - 4) + ";" + clamp(curCol, 6, cols) + "H" + ESC + "[?25h");
+  const curCol = 6 + Math.min(stripAnsi(UI.input).length, inW);
+  out.push(ESC + "[" + (rows - 4) + ";" + clamp(curCol, 6, Math.max(6, barX - 2)) + "H" + ESC + "[?25h");
   process.stdout.write(out.join(""));
 }
 
@@ -2364,7 +2388,12 @@ function copyToClipboard(txt) {
 }
 function onKey(str, key) {
   try {
-    if (SPLASH) { skipSplash(); return; }
+    if (SPLASH) {
+      skipSplash();
+      // the character a keg hunter types the instant the splash is up must land in the box, not vanish
+      const printable = str && str.length === 1 && !(key && key.ctrl) && !(key && key.meta) && /^[ -~\u00a0-\u024f\u2000-\u30ff]$/.test(str);
+      if (!printable) return;
+    }
     // SGR mouse bursts arrive fragmented by readline: ESC[< + digits + M/m
     if (key && key.code === "[<") { MOUSE_FRAG = true; MOUSE_BUF = ""; return; }
     if (MOUSE_FRAG) {
