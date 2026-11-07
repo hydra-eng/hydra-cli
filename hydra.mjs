@@ -272,9 +272,16 @@ const TOOLS_SCHEMA = [
 //  chat: streaming completion with tool calls + abort
 // ------------------------------------------------------------
 // hard deadline for model calls so a dead provider server can never hang the app forever
-// (tune with env HYDRA_MODEL_TIMEOUT, milliseconds)
+// the killer watches STREAM IDLE, not total wall clock: while tokens keep flowing a reply can run as long as it needs.
+// no-data-only aborts: a slow pause between tokens on a cold local model no longer kills the turn mid-sentence.
+// tune the pause window with env HYDRA_MODEL_IDLE, ms (HYDRA_MODEL_TIMEOUT still sets it, for test rigs);
+// a total cap still exists via HYDRA_MODEL_TIMEOUT for non-streaming JSON endpoints.
 const MODEL_TIMEOUT = Math.max(5000, Number(process.env.HYDRA_MODEL_TIMEOUT) || 180000);
 const withTimeout = (signal, ms) => AbortSignal.any([signal, AbortSignal.timeout(ms)].filter(Boolean));
+// never stars the stream: re-armed on every chunk inside chatOnce (TTFB + each decode window)
+const MODEL_IDLE = Math.max(5000,
+  Number(process.env.HYDRA_MODEL_IDLE)
+  || (Number(process.env.HYDRA_MODEL_TIMEOUT) ? Math.min(Number(process.env.HYDRA_MODEL_TIMEOUT), MODEL_TIMEOUT) : 90000));
 const TOOL_TIMEOUT = Math.max(15000, Number(process.env.HYDRA_TOOL_TIMEOUT) || 300000);
 
 function runShellAsync(command, cwd, timeoutMs, signal) {
@@ -311,52 +318,73 @@ async function chatOnce(messages, provider, ondelta, signal, noTools) {
   if (isOllama && provider.keepAlive) body.keep_alive = provider.keepAlive;
   const headers = { "Content-Type": "application/json" };
   if (provider.apiKey) headers.Authorization = "Bearer " + provider.apiKey;
-  const res = await fetch(provider.baseURL.replace(/\/$/, "") + "/chat/completions", {
-    method: "POST", headers, body: JSON.stringify(body), signal: withTimeout(signal, MODEL_TIMEOUT),
-  });
-  const ct0 = res.headers.get("content-type") || "";
-  if (!ct0.includes("text/event-stream")) {
-    const j = await res.json();
-    if (!res.ok) throw new Error(j.error?.message || j.error || j.message || "HTTP " + res.status);
-    const m = j.choices?.[0]?.message || {};
-    return { content: m.content || "", tool_calls: m.tool_calls || null };
-  }
-  const decoder = new TextDecoder();
-  let buf = "", content = "", reasonBuf = "";
-  const toolCalls = [];
-  const reader = res.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const parts = buf.split("\n");
-    buf = parts.pop() || "";
-    for (const line of parts) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const payload = t.slice(5).trim();
-      if (payload === "[DONE]") continue;
-      let j; try { j = JSON.parse(payload); } catch { continue; }
-      if (j.type === "error") throw new Error(j.error?.message || "provider error");
-      const d = j.choices?.[0]?.delta || {};
-      if (d.reasoning_content) reasonBuf += d.reasoning_content;
-      if (d.content) { content += d.content; if (ondelta) ondelta(d.content); }
-      for (const tc of d.tool_calls || []) {
-        const idx = tc.index ?? toolCalls.length;
-        toolCalls[idx] = toolCalls[idx] || { id: tc.id || "call_" + idx, type: "function", function: { name: "", arguments: "" } };
-        if (tc.id) toolCalls[idx].id = tc.id;
-        if (tc.function?.name) toolCalls[idx].function.name = (toolCalls[idx].function.name || "") + tc.function.name;
-        if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+  // idle guard ( re-armed on every chunk ): while data arrives the turn can run forever,
+  // as soon as the provider goes silent for MODEL_IDLE it aborts and the turn reports "model timed out"
+  const ctl = new AbortController();
+  let idleT = null;
+  let idleErr = null;
+  const armIdle = () => {
+    try { if (idleT) clearTimeout(idleT); } catch { /* nop */ }
+    idleT = setTimeout(() => {
+      idleErr = new Error("model timed out \u00b7 " + Math.round(MODEL_IDLE / 1000) + "s with no stream data");
+      try { ctl.abort(idleErr); } catch { /* nop */ }
+    }, MODEL_IDLE);
+  };
+  const onOuter = () => { try { ctl.abort(); } catch { /* nop */ } };
+  if (signal) { if (signal.aborted) onOuter(); else signal.addEventListener("abort", onOuter, { once: true }); }
+  armIdle();   // arms the connect + first-token window too
+  try {
+    const res = await fetch(provider.baseURL.replace(/\/$/, "") + "/chat/completions", {
+      method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.any([signal, ctl.signal].filter(Boolean)),
+    });
+    const ct0 = res.headers.get("content-type") || "";
+    if (!ct0.includes("text/event-stream")) {
+      const j = await res.json();   // non-streaming JSON endpoints still ride the idle guard
+      if (!res.ok) throw new Error(j.error?.message || j.error || j.message || "HTTP " + res.status);
+      const m = j.choices?.[0]?.message || {};
+      return { content: m.content || "", tool_calls: m.tool_calls || null };
+    }
+    const decoder = new TextDecoder();
+    let buf = "", content = "", reasonBuf = "";
+    const toolCalls = [];
+    const reader = res.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      armIdle();   // every token resets the pause window, so long thinking periods only kill if truly silent
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const parts = buf.split("\n");
+      buf = parts.pop() || "";
+      for (const line of parts) {
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const payload = t.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        let j; try { j = JSON.parse(payload); } catch { continue; }
+        if (j.type === "error") throw new Error(j.error?.message || "provider error");
+        const d = j.choices?.[0]?.delta || {};
+        if (d.reasoning_content) reasonBuf += d.reasoning_content;
+        if (d.content) { content += d.content; if (ondelta) ondelta(d.content); }
+        for (const tc of d.tool_calls || []) {
+          const idx = tc.index ?? toolCalls.length;
+          toolCalls[idx] = toolCalls[idx] || { id: tc.id || "call_" + idx, type: "function", function: { name: "", arguments: "" } };
+          if (tc.id) toolCalls[idx].id = tc.id;
+          if (tc.function?.name) toolCalls[idx].function.name = (toolCalls[idx].function.name || "") + tc.function.name;
+          if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+        }
       }
     }
+    if (!content && !toolCalls.length && reasonBuf) content = reasonBuf;
+    return {
+      content,
+      tool_calls: toolCalls.length
+        ? toolCalls.filter(Boolean).map((t) => ({ ...t, function: { ...t.function, arguments: t.function.arguments || "{}" } }))
+        : null,
+    };
+  } finally {
+    try { if (idleT) clearTimeout(idleT); } catch { /* nop */ }
+    if (signal) { try { signal.removeEventListener("abort", onOuter); } catch { /* nop */ } }
   }
-  if (!content && !toolCalls.length && reasonBuf) content = reasonBuf;
-  return {
-    content,
-    tool_calls: toolCalls.length
-      ? toolCalls.filter(Boolean).map((t) => ({ ...t, function: { ...t.function, arguments: t.function.arguments || "{}" } }))
-      : null,
-  };
 }
 
 const MAX_STEPS = 32;
@@ -2324,7 +2352,7 @@ async function runAgentTurn(q, extraSystem) {
   } catch (e) {
     const timedOut = e.name === "TimeoutError" || /timed out|aborted due to timeout/.test(e.message || "");
     outcome = e.name === "AbortError" ? "interrupted" : timedOut ? "model timed out" : "turn error";
-    const msg = e.name === "AbortError" ? "interrupted" : timedOut ? "model timed out after " + Math.round(MODEL_TIMEOUT / 1000) + "s \u00b7 provider \u201c" + provider.name + "\u201d not responding \u00b7 esc interrupts too \u00b7 HYDRA_MODEL_TIMEOUT tunes this" : (e.message || String(e));
+    const msg = e.name === "AbortError" ? "interrupted" : timedOut ? "model timed out \u00b7 " + Math.round(MODEL_IDLE / 1000) + "s went by with no stream data (elapsed " + fmtDur(Date.now() - UI.busyStart) + ") \u00b7 provider \u201c" + provider.name + "\u201d went silent \u00b7 esc interrupts too \u00b7 HYDRA_MODEL_IDLE tunes this (streaming replies have no wall-clock limit)" : (e.message || String(e));
     addLog(cc(e.name === "AbortError" ? DIM : timedOut ? "\u001b[33m" : "\u001b[31m", " " + msg));
     if (/model.*not.*found|invalid model|model_id|http 404\b/i.test(e.message || "")) addLog(cc(DIM, " the provider didn't take that model id \u00b7 /model opens the live list for this provider \u00b7 /provider use <name> flips back"));
     if (HISTORY[HISTORY.length - 1]?.content !== q) HISTORY.push({ role: "user", content: q });
