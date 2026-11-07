@@ -2356,6 +2356,7 @@ let running = true; void running;
 // ------------------------------------------------------------
 let MOUSE_FRAG = false;
 let MOUSE_BUF = "";
+let MOUSE_LEG = false;   // legacy ESC[M byte grammar ( conhost/older consoles ) vs SGR ESC[<
 let CLICK_ROW = null;   // press target while using the mouse in dialogs/popups
 let SELECTION = null;   // {a:{r,c}, b:{r,c}} in screen cells while dragging
 let SCR = [];           // plain-text snapshot of the last frame (for drag-select copy)
@@ -2386,6 +2387,75 @@ function copyToClipboard(txt) {
     runShellAsync("Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "')))", CWD, 3000).catch(() => { /* nop */ });
   } catch { /* nop */ }
 }
+// one mouse core for both grammars ( SGR ESC[< and legacy ESC[M ): btn 0/32 = press/drag, 64/65 = wheel, rel = button-up
+function mouseAction(btn, mx, my, rel) {
+  try {
+    const dlg = UI.dialog, pop = UI.popupOpen && UI.popupItems.length;
+    if (rel && btn >= 64) return;                       // wheel-up never behaves like a release
+    if (btn === 64 || btn === 65) {                     // wheel
+      const up = btn === 64;
+      if (pop) { UI.popupSel = clamp(UI.popupSel + (up ? -1 : 1), 0, UI.popupItems.length - 1); scheduleDraw(); }
+      else if (dlg) { dlg.sel = clamp(dlg.sel + (up ? -1 : 1), 0, Math.max(0, dlg.items.length - 1)); syncDialogPreview(); scheduleDraw(true); }
+      else nudgeScroll(up ? 3 : -3);
+    } else if (!rel && btn === 0) {                       // left press
+      if (dlg && dlg.geo) {
+        const g = dlg.geo;
+        if (my > g.dtop && my <= g.dbot && mx < g.listW) {
+          const k = my - (g.dtop + 1);
+        if (k >= 0 && k < g.visibleCount && dlg.items[g.startSel + k]) {
+          dlg.sel = g.startSel + k; CLICK_ROW = { r: my, inDlg: true }; syncDialogPreview(); scheduleDraw(true);
+        }
+        }
+      } else if (pop && UI.popupGeo) {
+        const g = UI.popupGeo;
+        if (my > g.top && my <= g.top + g.n) { UI.popupSel = g.startSel + (my - g.top - 1); CLICK_ROW = { r: my, inPop: true }; scheduleDraw(); }
+      } else {
+        SELECTION = { a: { r: my, c: mx }, b: { r: my, c: mx } }; CLICK_ROW = null;
+        fullDraw = true; scheduleDraw(true);
+      }
+    } else if (!rel && btn === 32) {                      // drag
+      if (CLICK_ROW && CLICK_ROW.inDlg && dlg && dlg.geo) {
+        const g = dlg.geo;
+        if (my > g.dtop && my <= g.dbot) {
+          const k = my - (g.dtop + 1);
+          if (k >= 0 && k < g.visibleCount && dlg.items[g.startSel + k] && g.startSel + k !== dlg.sel) {
+            dlg.sel = g.startSel + k; syncDialogPreview(); scheduleDraw(true);
+          }
+        }
+        CLICK_ROW = { r: my, inDlg: true };
+      } else if (SELECTION) { SELECTION.b = { r: my, c: mx }; scheduleDraw(true); }
+    } else if (rel) {                                     // release
+      if (SELECTION) {
+        const sel = SELECTION; SELECTION = null;
+        const clickOnly = sel.a.r === sel.b.r && sel.a.c === sel.b.c;
+        // a plain click without a drag grabs the whole hovered line (trimmed, seam stripped) instead of a lone cell
+        let txt;
+        if (clickOnly) {
+          const L2 = SCR[sel.a.r] || "";
+          const seam = L2.indexOf("\u2562");
+          const lo = L2.slice(0, seam >= 0 ? seam : L2.length);
+          txt = lo.replace(/^\s+/, "").replace(/\s+$/, "");
+        } else txt = selectionText(sel);
+        if (txt) {
+          copyToClipboard(txt);
+          addLog(cc(DIM, " \u2398 copied " + txt.split("\n").length + " lines (" + txt.length + " chars)" + (clickOnly ? " (hover-click grabs the whole row)" : "") + " to clipboard"));
+          toast("copied " + txt.split("\n").length + " lines \u00b7 " + txt.length + " chars");
+        } else {
+          addLog(cc(DIM, " selection is empty \u00b7 drag across text, or click a row to grab it"));
+        }
+        fullDraw = true; scheduleDraw(true);
+      } else if (CLICK_ROW && CLICK_ROW.inDlg) {
+        const same = CLICK_ROW.r === my;
+        CLICK_ROW = null;
+        if (same) dialogActivate();
+      } else if (CLICK_ROW && CLICK_ROW.inPop) {
+        const same = CLICK_ROW.r === my;
+        CLICK_ROW = null;
+        if (same) popupActivate();
+      } else CLICK_ROW = null;
+    }
+  } catch (e) { crashLog(e); }
+}
 function onKey(str, key) {
   try {
     if (SPLASH) {
@@ -2394,67 +2464,26 @@ function onKey(str, key) {
       const printable = str && str.length === 1 && !(key && key.ctrl) && !(key && key.meta) && /^[ -~\u00a0-\u024f\u2000-\u30ff]$/.test(str);
       if (!printable) return;
     }
-    // SGR mouse bursts arrive fragmented by readline: ESC[< + digits + M/m
-    if (key && key.code === "[<") { MOUSE_FRAG = true; MOUSE_BUF = ""; return; }
+    // SGR mouse bursts arrive fragmented by readline: ESC[< + digits + M/m ; legacy consoles: ESC[M + 3 raw bytes
+    if (key && (key.code === "[<" || key.code === "[M")) { MOUSE_FRAG = true; MOUSE_BUF = ""; MOUSE_LEG = key.code === "[M"; return; }
     if (MOUSE_FRAG) {
+      if (MOUSE_LEG) {
+        if (str && str.length === 1) MOUSE_BUF += str;
+        if (MOUSE_BUF.length >= 3) {
+          const cb = MOUSE_BUF.charCodeAt(0) - 32;
+          const mx = clamp(MOUSE_BUF.charCodeAt(1) - 33, 0, UI.cols - 1);
+          const my = clamp(MOUSE_BUF.charCodeAt(2) - 33, 0, UI.rows - 1);
+          MOUSE_FRAG = false; MOUSE_LEG = false; MOUSE_BUF = "";
+          mouseAction(cb & 63, mx, my, (cb & 3) === 3);
+        }
+        return;
+      }
       if (/^[0-9;]$/.test(str || "")) { MOUSE_BUF += str; return; }
       if (str === "M" || str === "m") {
         const ps = MOUSE_BUF.split(";").map((n) => parseInt(n, 10) || 0);
         const btn = ps[0] || 0, mx = (ps[1] || 1) - 1, my = (ps[2] || 1) - 1;
-        const dlg = UI.dialog, pop = UI.popupOpen && UI.popupItems.length;
-        if (btn === 64 || btn === 65) {                       // wheel
-          const up = btn === 64;
-          if (pop) { UI.popupSel = clamp(UI.popupSel + (up ? -1 : 1), 0, UI.popupItems.length - 1); scheduleDraw(); }
-          else if (dlg) { dlg.sel = clamp(dlg.sel + (up ? -1 : 1), 0, Math.max(0, dlg.items.length - 1)); syncDialogPreview(); scheduleDraw(true); }
-          else nudgeScroll(up ? 3 : -3);
-        } else if (str === "M" && btn === 0) {                 // left press
-          if (dlg && dlg.geo) {
-            const g = dlg.geo;
-            if (my > g.dtop && my <= g.dbot && mx < g.listW) {
-              const k = my - (g.dtop + 1);
-            if (k >= 0 && k < g.visibleCount && dlg.items[g.startSel + k]) {
-              dlg.sel = g.startSel + k; CLICK_ROW = { r: my, inDlg: true }; syncDialogPreview(); scheduleDraw(true);
-            }
-            }
-          } else if (pop && UI.popupGeo) {
-            const g = UI.popupGeo;
-            if (my > g.top && my <= g.top + g.n) { UI.popupSel = g.startSel + (my - g.top - 1); CLICK_ROW = { r: my, inPop: true }; scheduleDraw(); }
-          } else {
-            SELECTION = { a: { r: my, c: mx }, b: { r: my, c: mx } }; CLICK_ROW = null;
-            fullDraw = true; scheduleDraw(true);
-          }
-        } else if (str === "M" && btn === 32) {                // drag
-          if (CLICK_ROW && CLICK_ROW.inDlg && dlg && dlg.geo) {
-            const g = dlg.geo;
-            if (my > g.dtop && my <= g.dbot) {
-              const k = my - (g.dtop + 1);
-              if (k >= 0 && k < g.visibleCount && dlg.items[g.startSel + k] && g.startSel + k !== dlg.sel) {
-                dlg.sel = g.startSel + k; syncDialogPreview(); scheduleDraw(true);
-              }
-            }
-            CLICK_ROW = { r: my, inDlg: true };
-          } else if (SELECTION) { SELECTION.b = { r: my, c: mx }; scheduleDraw(true); }
-        } else if (str === "m" && btn === 0) {                 // release
-          if (SELECTION) {
-            const sel = SELECTION; SELECTION = null;
-            const txt = selectionText(sel);
-            if (txt) {
-              copyToClipboard(txt);
-              addLog(cc(DIM, " \u2398 copied " + txt.split("\n").length + " lines (" + txt.length + " chars) to clipboard"));
-              toast("copied " + txt.split("\n").length + " lines \u00b7 " + txt.length + " chars");
-            }
-            fullDraw = true; scheduleDraw(true);
-          } else if (CLICK_ROW && CLICK_ROW.inDlg) {
-            const same = CLICK_ROW.r === my;
-            CLICK_ROW = null;
-            if (same) dialogActivate();
-          } else if (CLICK_ROW && CLICK_ROW.inPop) {
-            const same = CLICK_ROW.r === my;
-            CLICK_ROW = null;
-            if (same) popupActivate();
-          } else CLICK_ROW = null;
-        }
-        MOUSE_FRAG = false;
+        MOUSE_FRAG = false; MOUSE_BUF = "";
+        mouseAction(btn, mx, my, str === "m");
       }
       return;
     }
