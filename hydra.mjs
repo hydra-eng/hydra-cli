@@ -193,7 +193,12 @@ function mdRender(text, width) {
       let j = i;
       while (j < lines.length && lines[j].includes("|") && lines[j].trim() !== "" && !/^\s*```/.test(lines[j])) { blk.push(lines[j]); j++; }
       const rendered = mdTable(blk, W);
-      if (rendered) { out.push(...rendered); i = j; continue; }
+      if (rendered) {
+        if (out.length && out[out.length - 1].trim() !== "") out.push("");
+        out.push(...rendered);
+        out.push("");
+        i = j; continue;
+      }
     }
     const hm = /^\s*(#{1,6})\s+(.*?)\s*$/.exec(line);
     if (hm) { out.push(cc(hm[1].length <= 2 ? CRIMSON + BOLD : CRIMSON, mdInline(hm[2]))); i++; continue; }
@@ -826,15 +831,17 @@ function helpLines() {
     cc(DIM, " /regen               regenerate the last reply \u00b7 /undo removes the last exchange"),
     cc(DIM, " /web <url>           fetch a web page into the conversation context"),
     cc(DIM, " /stats               turns \u00b7 approx tokens \u00b7 session/model/provider info"),
-    cc(DIM, " /copylast            copy last reply to clipboard"),
+    cc(DIM, " /copylast            copy last reply ( same as alt+c )"),
     "",
     cc(CRIMSON + BOLD, " agent loop \u00b7 hermes-grade"),
     cc(DIM, " <skill> <task>       start a message with a skill name: its guide auto-loads"),
     cc(DIM, " @file.md             attach a file to your message (\u22644 files \u00b7 \u2264240 KB each)"),
     cc(DIM, " \u23f3 queueing           type + enter while a turn runs: your prompt waits, then runs"),
     cc(DIM, " todo tool            the model keeps a visible checklist for multi-step work"),
-    cc(DIM, " \u2398 copy / paste       drag-select copies \u00b7 ctrl+a copies the screen \u00b7 esc clears \u00b7 ctrl+v paste"),
+    cc(DIM, " \u2398 copy / paste       drag-select copies paragraphs \u00b7 click grabs a row \u00b7 double-click a whole paragraph"),
     cc(DIM, " ctrl+c               first press copies the selection / clears the prompt \u00b7 again exits"),
+    cc(DIM, " alt+c                copy the entire last reply (raw markdown, unmangled)"),
+    cc(DIM, " ctrl+v / shift+ins   paste the clipboard into the prompt (multi-line safe)"),
     cc(DIM, " /skills              list installed skills (agent + opencode/claude dirs)"),
     cc(DIM, " /learn <src>         distill text/url/file into a NEW skill (agent writes it)"),
     cc(DIM, " /hub                 browse + install community skills (secret scan at install)"),
@@ -987,7 +994,7 @@ function enterTUI() {
     readline.emitKeypressEvents(process.stdin);
     process.stdin.on("data", () => { });
     try { process.stdin.resume(); } catch { /* nop */ }
-    process.stdout.write(ESC + "[?1049h" + ESC + "[?25l" + ESC + "[?1000h" + ESC + "[?1006h");
+    process.stdout.write(ESC + "[?1049h" + ESC + "[?25l" + ESC + "[?1000h" + ESC + "[?1006h" + ESC + "[?2004h");
     process.stdout.on("resize", () => {
       if (process.stdout.rows) UI.rows = process.stdout.rows;
       if (process.stdout.columns) UI.cols = process.stdout.columns;
@@ -999,7 +1006,7 @@ function enterTUI() {
 }
 function exitTUI() {
   if (process.stdout.isTTY) {
-    process.stdout.write(ESC + "[?25h" + ESC + "[?1000l" + ESC + "[?1006l" + ESC + "[?1049l");
+    process.stdout.write(ESC + "[?25h" + ESC + "[?1000l" + ESC + "[?1006l" + ESC + "[?2004l" + ESC + "[?1049l");
     try { process.stdin.setRawMode(false); } catch { /* nop */ }
   }
 }
@@ -1036,6 +1043,7 @@ async function pasteClipboard() {
   // async spawn with a tight cap: a clipboard held by another process used to brick the UI for up to 15s
   startBusy("pasting");
   try {
+    if (process.env.HYDRA_TEST) { stopBusy(); addLog(cc(DIM, " (test rig: real clipboard reads disabled)")); return; }
     const r = await runShellAsync("Get-Clipboard -Raw", CWD, 3000).catch(() => null);
     let txt = String(((r && r.status === 0) ? r.stdout : "") || "").replace(/\r/g, "").replace(/\n+/g, " ").trim();
     if (!txt && !(r && r.status === 0)) { stopBusy(); addLog(cc("\u001b[31m", " paste failed (clipboard busy or unavailable)")); return; }
@@ -1346,7 +1354,8 @@ function panelTexts() {
     cc(DIM, clip(shortPath(CWD), W)),
     cc(DIM, "-".repeat(Math.max(4, W - 1))),
     cc(CRIMSON + BOLD, UI.mode),
-    cc(DIM, "t" + UI.turn + " tools" + TOOL_CALLS_TOTAL + " " + fmtDur(Date.now() - SESSION_START)),
+    cc(DIM, "turns " + UI.turn + " \u00b7 tools " + Math.min(999, TOOL_CALLS_TOTAL)),
+    cc(DIM, fmtDur(Date.now() - SESSION_START) + " session"),
     cc(DIM, "-".repeat(Math.max(4, W - 1))),
     cc(DIM, "sessions " + cachedCount("sessions", sessionCount)),
     cc(DIM, "skills   " + cachedCount("skills", skillsCount)),
@@ -1772,14 +1781,46 @@ function drawFrame() {
     ? HYDRA_MARK.concat(WORDMARK)
     : WORDMARK;
   const scroll = [];
-  for (const l of COMBO) scroll.push(cc(CRIMSON + BOLD, centerText(l, LW)));
+  const SMETA = [];   // per scroll line: { e, pi, first, last, para, boxed } or null ( banner / non-entry lines )
+  for (const l of COMBO) { scroll.push(cc(CRIMSON + BOLD, centerText(l, LW))); SMETA.push(null); }
   const NOW_MS = Date.now();
   // -------- compose chat log flat lines into the same scrollback
   for (const e of UI.log) {
-    if (!e.cache || e.cacheW !== LW) { e.cache = wrapText(mdRender(e.text, LW - 1), LW - 1); e.cacheW = LW; }
+    if (!e.cache || e.cacheW !== LW) {
+      // rebuild the entry's display cache AND its copy map ( per physical line: paragraph id, table/fence flag )
+      const mdT = mdRender(e.text, LW - 1);
+      const phys = mdT.split("\n");
+      const paraOf = [];
+      let pid = 0, sawText = false;
+      for (let pi = 0; pi < phys.length; pi++) {
+        if (phys[pi].trim() === "") { paraOf.push(-1); if (sawText) { pid++; sawText = false; } }
+        else { paraOf.push(pid); sawText = true; }
+      }
+      const BOX_GLYPH = /^\s*[\u250c\u251c\u2514\u2570\u2502]/;
+      const boxed = phys.map((pl) => BOX_GLYPH.test(stripAnsi(pl)));   // box rows carry a dim style prefix -> classify on the plain text
+      e.cache = [];
+      e.map = [];
+      for (let pi = 0; pi < phys.length; pi++) {
+        const ws = wrapText(phys[pi], LW - 1);
+        for (let wi = 0; wi < ws.length; wi++) {
+          e.map.push({ e, pi, first: wi === 0, last: wi === ws.length - 1, para: paraOf[pi], boxed: boxed[pi] });
+          e.cache.push(ws[wi]);
+        }
+      }
+      e.mdphys = phys; e.paraRange = {};
+      for (let pi = 0; pi < paraOf.length; pi++) {
+        const id = paraOf[pi];
+        if (id >= 0) { if (e.paraRange[id]) e.paraRange[id][1] = pi; else e.paraRange[id] = [pi, pi]; }
+      }
+      e.cacheW = LW;
+    }
     const fresh = NOW_MS - (e.t || 0) < 1500;   // brand-new rows leak in bright for a beat, then settle (log flash-in)
-    if (fresh) e.cache.forEach((l, ix) => scroll.push(ix === 0 ? cc(CRIMSON + BOLD, "\u258e ") + l : l));
-    else for (const l of e.cache) scroll.push(l);
+    let cvi = 0;
+    for (const l of e.cache) {
+      scroll.push(fresh && cvi === 0 ? cc(CRIMSON + BOLD, "\u258e ") + l : l);
+      SMETA.push(e.map && e.map[cvi] ? e.map[cvi] : null);
+      cvi++;
+    }
   }
   const maxScroll = Math.max(0, scroll.length - BODY);
   UI.scroll = clamp(UI.scroll, 0, maxScroll);
@@ -1792,6 +1833,11 @@ function drawFrame() {
     UI.anchorStart = vStart;
     UI.anchorScroll = UI.scroll;
   } else { UI.anchorStart = null; UI.anchorScroll = null; }
+  // viewport-aligned copy map: SCRMETA[row] mirrors SMETA[scroll index] so drag selection
+  // can reconstruct the ORIGINAL paragraph text instead of the visually wrapped fragments
+  SCRMETA = new Array(rows).fill(null);
+  for (let i = 0; i < BODY; i++) SCRMETA[2 + i] = SMETA[vStart + i] ?? null;
+  SCRVSTART = vStart;
   // -------- compose panel flat lines
   const pflat = [];
   for (const t of panelTexts()) { for (const l of wrapText(t, PANEL_W - 2)) pflat.push(l); }
@@ -2246,17 +2292,7 @@ async function submitLine() {
     addLog(cc(CRIMSON + BOLD, "  + new session \u00b7 context cleared, files untouched"));
     return;
   }
-  if (q === "/copylast") {
-    const lu = [...HISTORY].reverse().find((m) => m.role === "assistant");
-    if (!lu) { addLog(cc(DIM, " nothing to copy yet")); return; }
-    try {
-      const txt = String(lu.content || "").slice(0, 100000);
-      const b64 = Buffer.from(txt, "utf8").toString("base64");
-      const r = await runShellAsync("Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "')))", CWD, 3000).catch(() => null);
-      addLog(cc(DIM, r && r.status === 0 ? " last reply copied to clipboard (" + txt.length + " chars)" : " copy failed (clipboard busy or unavailable)"));
-    } catch (e) { addLog(cc("\u001b[31m", " copy failed: " + e.message)); }
-    return;
-  }
+  if (q === "/copylast") { copyLastReply(); return; }
   if (q === "/skills") {
     const s = listSkillDirs();
     if (!s.length) { addLog(cc(DIM, " no skills found in " + skillDirsLL().join(" ") + " \u00b7 say \u201ccreate a skill \u2026\u201d and hydra writes one itself")); return; }
@@ -2478,13 +2514,15 @@ async function runAgentTurn(q, extraSystem) {
   try {
     await agentLoop(q, provider, (t) => {
       streamed += t;
-      const lines = wrapText(streamed, UI.cols - PANEL_W - 3).join("\n");
-      if (curLog) { curLog.cache = null; curLog.text = lines; }
-      else { addLog(lines); curLog = UI.log[UI.log.length - 1]; }
+      // single path: the entry keeps the RAW markdown and the drawer renders it every frame —
+      // tables align live while rows stream in, instead of a wrapped garble being finalized after
+      if (curLog) { curLog.cache = null; curLog.text = streamed; }
+      else { addLog(streamed); curLog = UI.log[UI.log.length - 1]; }
       scheduleDraw();
     }, (tool) => {
       addLog(cc(CRIMSON, "  > ") + cc(DIM, truncateLine(tool, Math.max(30, UI.cols - PANEL_W - 4))));
       curLog = null; streamed = "";
+      scheduleDraw();
     }, HISTORY, ABORT.signal, plan, extraSystem);
     if (plan) addLog(cc(DIM, "  (plan mode - no tools were run)"));
     if (!streamed.trim() && ABORT.signal.aborted) { addLog(cc(DIM, " interrupted")); outcome = "interrupted"; }
@@ -2527,35 +2565,93 @@ let running = true; void running;
 //  keys + sessions + entry
 // ------------------------------------------------------------
 let MOUSE_FRAG = false;
+let PASTE_BUF = null;   // != null while a bracketed paste is being accumulated
 let MOUSE_BUF = "";
 let MOUSE_LEG = false;   // legacy ESC[M byte grammar ( conhost/older consoles ) vs SGR ESC[<
 let CLICK_ROW = null;   // press target while using the mouse in dialogs/popups
 let SELECTION = null;   // {a:{r,c}, b:{r,c}} in screen cells while dragging
 let SCR = [];           // plain-text snapshot of the last frame (for drag-select copy)
+let SCRMETA = [];       // viewport-aligned line meta ( entry + physical line + para id ) for paragraph-aware copy
+let SCRVSTART = 0;
+let LAST_CLICK = null;  // { r, t } for double-click paragraph grab
 
 function plainRow(text, width) {
   const p = stripAnsi(text);
   return p.length > width ? p.slice(0, width) : p + " ".repeat(width - p.length);
 }
+// the visible text of one screen row up to the panel seam, with styles AND decorations stripped ( copy must be clean text )
+function chunkText(r) {
+  let L = stripAnsi(SCR[r] || "");
+  const seam = L.indexOf("\u2562");
+  if (seam >= 0) L = L.slice(0, seam);
+  L = L.replace(/^[ \t]*\u258e /, " ");
+  L = L.replace(/^[ \t]*\u276f /, " ");
+  return L.trim();
+}
+const mdBoxedLine = (s) => /^\s*[\u250c\u251c\u2514\u2570\u2502]/.test(String(s));
+// rejoin wrapped chunks of one source paragraph: prose lines glue with spaces, table/fence rows stay boxed with \n ( styles stripped )
+function mdJoinPhys(phys, i0, i1) {
+  let out = "", cur = "";
+  for (let i = i0; i <= i1; i++) {
+    const t = stripAnsi(String(phys[i] ?? "")).trim();
+    if (!t) continue;
+    if (mdBoxedLine(t)) { if (cur) { out += (out ? "\n" : "") + cur; cur = ""; } out += (out ? "\n" : "") + t; }
+    else cur += (cur ? " " : "") + t;
+  }
+  if (cur) out += (out ? "\n" : "") + cur;
+  return out;
+}
 function selectionText(sel) {
   if (!sel) return "";
   const r0 = Math.min(sel.a.r, sel.b.r), r1 = Math.max(sel.a.r, sel.b.r);
-  const lines = [];
-  for (let r = r0; r <= r1; r++) {
-    const line = SCR[r] || "";
-    let c0 = 0, c1 = line.length - 1;
-    if (sel.a.r === sel.b.r) { c0 = Math.min(sel.a.c, sel.b.c); c1 = Math.max(sel.a.c, sel.b.c); }
-    else if (r === r0) { c0 = sel.a.r === r0 ? sel.a.c : sel.b.c; }
-    else if (r === r1) { c1 = sel.a.r === r1 ? sel.a.c : sel.b.c; }
-    lines.push(line.slice(c0, c1 + 1).replace(/\s+$/, ""));
+  if (r0 === r1) {   // single-row: precise column slice, never reaching into the rail seam
+    const L = stripAnsi(SCR[r0] || "");   // visible coordinates are plain-text positions -> strip styles BEFORE slicing
+    const seam = L.indexOf("\u2562");
+    const hardEnd = seam >= 0 ? seam : L.length;
+    const c0 = Math.min(Math.min(sel.a.c, sel.b.c), hardEnd);
+    const c1 = Math.min(Math.max(sel.a.c, sel.b.c), hardEnd - 1);
+    const t = L.slice(Math.max(0, c0), c1 + 1).replace(/[ \t]+$/, "").trim();
+    return t.replace(/^[ \t]*\u258e /, "").replace(/^[ \t]*\u276f /, "");
   }
-  return lines.filter((l) => l.length).join("\n");
+  // multi-row: rebuild paragraphs from the copy map — wrapped fragments glue back into whole lines
+  const parts = [];
+  let cur = "", curCtx = null;
+  const flush = () => { if (cur.trim() !== "") parts.push(cur.replace(/[ \t]+$/, "")); cur = ""; curCtx = null; };
+  for (let r = r0; r <= r1; r++) {
+    const t = chunkText(r);
+    const m = SCRMETA[r];
+    if (!t) { flush(); continue; }
+    if (cur === "") { cur = t; curCtx = { e: m && m.e, pi: m && m.pi, para: m && m.para, boxed: !!(m && m.boxed) }; continue; }
+    const glue = curCtx && m && curCtx.e === m.e && curCtx.para >= 0 && m.para === curCtx.para && !curCtx.boxed && !m.boxed;
+    if (glue) cur += " " + t;
+    else { flush(); cur = t; curCtx = { e: m && m.e, pi: m && m.pi, para: m && m.para, boxed: !!(m && m.boxed) }; }
+  }
+  flush();
+  return parts.join("\n");
+}
+// double-click opens up: copy the WHOLE source paragraph under the cursor ( even the part scrolled off )
+function paragraphGrab(r) {
+  const m = SCRMETA[r];
+  if (!m || !m.e || !m.e.mdphys || m.para == null || m.para < 0 || !m.e.paraRange[m.para]) return "";
+  const e = m.e;
+  const [p0, p1] = e.paraRange[m.para];
+  const txt = mdJoinPhys(e.mdphys, p0, p1);
+  return txt.trim();
+}
+function copyLastReply() {
+  const lu = [...HISTORY].reverse().find((m) => m.role === "assistant");
+  if (!lu) { addLog(cc(DIM, " nothing to copy yet")); return; }
+  const txt = String(lu.content || "").slice(0, 100000);
+  copyToClipboard(txt);
+  addLog(cc(DIM, " \u2398 last reply copied to clipboard (" + txt.length + " chars)"));
+  toast("reply copied \u00b7 " + txt.length + " chars");
 }
 function copyToClipboard(txt) {
   // fire-and-forget async spawn: the clipboard request can never stall the frame loop
   try {
     const b64 = Buffer.from(txt, "utf8").toString("base64");
     process.stdout.write(ESC + "]52;c;" + b64 + ESC + "\\");
+    if (process.env.HYDRA_TEST) return;   // test rigs never touch the host clipboard
     runShellAsync("Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + b64 + "')))", CWD, 3000).catch(() => { /* nop */ });
   } catch { /* nop */ }
 }
@@ -2600,21 +2696,31 @@ function mouseAction(btn, mx, my, rel) {
       if (SELECTION) {
         const sel = SELECTION; SELECTION = null;
         const clickOnly = sel.a.r === sel.b.r && sel.a.c === sel.b.c;
-        // a plain click without a drag grabs the whole hovered line (trimmed, seam stripped) instead of a lone cell
-        let txt;
-        if (clickOnly) {
-          const L2 = SCR[sel.a.r] || "";
-          const seam = L2.indexOf("\u2562");
-          const lo = L2.slice(0, seam >= 0 ? seam : L2.length);
-          txt = lo.replace(/^\s+/, "").replace(/\s+$/, "");
-        } else txt = selectionText(sel);
+        const now = Date.now();
+        let txt = "", desc = "the selection";
+        if (!clickOnly) {
+          txt = selectionText(sel);
+          LAST_CLICK = null;
+          desc = "the drag selection";
+        } else {
+          const dbl = LAST_CLICK && LAST_CLICK.r === sel.a.r && now - LAST_CLICK.t < 380;
+          if (dbl) {
+            txt = paragraphGrab(sel.a.r);
+            if (txt) { desc = "the paragraph"; }
+            else txt = "";   // not a mapped paragraph ( banner / rail ) -> fall through to the row grab
+          }
+          if (!txt) txt = chunkText(sel.a.r) || "";
+          if (txt && !dbl) desc = "the row";
+          LAST_CLICK = { r: sel.a.r, t: now };
+        }
         if (txt) {
           copyToClipboard(txt);
-          addLog(cc(DIM, " \u2398 copied " + txt.split("\n").length + " lines (" + txt.length + " chars)" + (clickOnly ? " (hover-click grabs the whole row)" : "") + " to clipboard"));
-          toast("copied " + txt.split("\n").length + " lines \u00b7 " + txt.length + " chars");
-        } else {
-          addLog(cc(DIM, " selection is empty \u00b7 drag across text, or click a row to grab it"));
-        }
+          const lines = txt.split("\n").length;
+          addLog(cc(DIM, " \u2398 copied " + txt.length + " chars" + (lines > 1 ? " in " + lines + " lines" : "") + (desc === "the paragraph" ? " \u00b7 double-click grabs a whole paragraph" : desc === "the row" ? " \u00b7 a click grabs its row" : "") + " to clipboard"));
+          toast("copied \u00b7 " + txt.length + " chars");
+        } else if (!clickOnly) {
+          addLog(cc(DIM, " selection is empty \u00b7 drag across text, click a row, double-click a paragraph"));
+        }   // blank clicks stay silent
         fullDraw = true; scheduleDraw(true);
       } else if (CLICK_ROW && CLICK_ROW.inDlg) {
         const same = CLICK_ROW.r === my;
@@ -2635,6 +2741,28 @@ function onKey(str, key) {
       // the character a keg hunter types the instant the splash is up must land in the box, not vanish
       const printable = str && str.length === 1 && !(key && key.ctrl) && !(key && key.meta) && /^[ -~\u00a0-\u024f\u2000-\u30ff]$/.test(str);
       if (!printable) return;
+    }
+    // ---- bracketed paste ( terminals send [200~..[201~ around a paste ): accumulate instead of
+    // letting every interior \r submit a separate turn; the block lands in the composer as one text
+    if (key && (key.name === "paste-start" || key.code === "[200~")) { PASTE_BUF = ""; return; }
+    if (PASTE_BUF !== null) {
+      if (key && (key.name === "paste-end" || key.code === "[201~")) {
+        let t = String(PASTE_BUF || "").replace(/\r\n?/g, "\n").replace(/\n+$/, "");
+        PASTE_BUF = null;
+        if (t.trim()) {
+          t = t.replace(/[ \t]*\n[ \t]*/g, " ");
+          setUserInput(UI.input + (UI.input && !/[\s.]$/.test(UI.input) ? " " : "") + t);
+          addLog(cc(DIM, "  \u2328 pasted " + t.length + " chars into the prompt \u00b7 enter runs it"));
+          scheduleDraw(true);
+        }
+      } else if (key && (key.name === "escape" || (key.ctrl && key.name === "c"))) {
+        PASTE_BUF = null;   // paste cancelled / abort
+        toast("paste cancelled");
+      } else if (key && (key.name === "return" || key.name === "enter")) PASTE_BUF += "\n";
+      else if (key && key.name === "backspace" && PASTE_BUF.length) PASTE_BUF = PASTE_BUF.slice(0, -1);
+      else if (str && str.length === 1) PASTE_BUF += str;
+      if (PASTE_BUF !== null && PASTE_BUF.length > 100000) PASTE_BUF = PASTE_BUF.slice(-100000);   // runaway guard
+      return;
     }
     // SGR mouse bursts arrive fragmented by readline: ESC[< + digits + M/m ; legacy consoles: ESC[M + 3 raw bytes
     if (key && (key.code === "[<" || key.code === "[M")) { MOUSE_FRAG = true; MOUSE_BUF = ""; MOUSE_LEG = key.code === "[M"; return; }
@@ -2659,10 +2787,10 @@ function onKey(str, key) {
       }
       return;
     }
-    if (!key) return;
+    if (key && (key.alt || key.meta) && key.name === "c") { copyLastReply(); return; }   // alt+c: one stroke copies the whole last reply ( Node gives ESC-key as meta, not alt )
     if (key.ctrl && key.name === "a") {
       // select-all copy: the plain-text screen snapshot goes to the clipboard in one stroke
-      const all = (SCR || []).slice(0, Math.max(1, UI.rows - 2)).join("\n").replace(/\n+$/g, "");
+      const all = (SCR || []).slice(0, Math.max(1, UI.rows - 2)).map((l) => stripAnsi(l)).join("\n").replace(/[ \t]+\n/g, "\n").replace(/\n+$/g, "");
       if (all.trim()) { copyToClipboard(all); toast("copied whole screen \u00b7 " + all.length + " chars"); }
       return;
     }
@@ -2880,7 +3008,7 @@ function tuiSession() {
   activeProvider();
   enterTUI();
   splashThenBoot();
-  process.on("exit", () => { try { saveSession(); process.stdout.write(ESC + "[?25h" + ESC + "[?1000l" + ESC + "[?1006l" + ESC + "[?1049l"); } catch { /* nop */ } });
+  process.on("exit", () => { try { saveSession(); process.stdout.write(ESC + "[?25h" + ESC + "[?1000l" + ESC + "[?1006l" + ESC + "[?2004l" + ESC + "[?1049l"); } catch { /* nop */ } });
   process.stdin.on("keypress", onKey);
   process.stdin.on("error", () => { /* nop */ });
   process.on("SIGINT", () => process.exit(0));
@@ -3031,7 +3159,7 @@ async function main() {
   process.on("unhandledRejection", (e) => { crashLog(e); console.error("unhandled: " + (e && (e.message || e))); });
   process.on("uncaughtException", (e) => {
     crashLog(e);
-    try { process.stdout.write(ESC + "[?25h" + ESC + "[?1049l"); } catch { /* nop */ }
+    try { process.stdout.write(ESC + "[?25h" + ESC + "[?1006l" + ESC + "[?2004l" + ESC + "[?1049l"); } catch { /* nop */ }
     console.error("crash: " + (e && (e.stack || e.message || e)));
     process.exit(1);
   });
@@ -3632,7 +3760,7 @@ async function main() {
 
 main().catch((e) => {
   crashLog({ stack: "mainPromise: " + ((e && e.stack) || e) });
-  try { process.stdout.write(ESC + "[?25h" + ESC + "[?1049l"); } catch { /* nop */ }
+  try { process.stdout.write(ESC + "[?25h" + ESC + "[?1006l" + ESC + "[?2004l" + ESC + "[?1049l"); } catch { /* nop */ }
   console.error("fatal: " + (e.message || e));
   process.exit(1);
 });
