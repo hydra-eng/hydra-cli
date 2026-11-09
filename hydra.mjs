@@ -2001,31 +2001,47 @@ async function radarScan(fp) {
     const B = path.basename(p);
     if (!fs.existsSync(p) || !fs.statSync(p).isFile() || fs.statSync(p).size > 2000000) return;
     const readables = new Set(["js", "mjs", "cjs", "ts", "tsx", "jsx", "vue", "svelte", "py", "ps1", "c", "cc", "cpp", "h", "hpp", "cs", "go", "rs", "java", "rb", "php", "sh", "json", "md", "yml", "yaml", "toml", "html", "css", "txt", "astro"]);
-    const skip = new Set(SKIP_DIRS.concat([".hydra", ".trash"]));
+    const skip = new Set(SKIP_DIRS.concat([".hydra", ".trash", "coverage", "vendor", "obj", ".gradle", ".terraform", ".pnpm-store", "site-packages", ".cache", ".svelte-kit", ".output", "__snapshots__"]));
     const hits = [];
-    const walk = (d, rel) => {
-      if (hits.length >= 40) return;
+    const t0 = Date.now();
+    let filesRead = 0, partial = false;
+    // BFS queue with event-loop yields: an async fn body is sync until its first await,
+    // so this walk breathes between directories — the TUI (keys, redraws, streaming) never stalls
+    const queue = [[CWD, "", 0]];
+    while (queue.length) {
+      if (hits.length >= 24) break;
+      if (filesRead >= 2500 || Date.now() - t0 > 400) { partial = true; break; }
+      const job = queue.shift();
+      const d = job[0], rel = job[1], lvl = job[2];
+      if (lvl > 12) continue;
       let names = [];
-      try { names = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      try { names = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
       for (const e of names) {
-        if (e.isDirectory()) { if (skip.has(e.name)) continue; walk(path.join(d, e.name), rel ? rel + "\\" + e.name : e.name); continue; }
+        if (hits.length >= 24) break;
+        if (e.isDirectory()) { if (!skip.has(e.name)) queue.push([path.join(d, e.name), rel ? rel + "\\" + e.name : e.name, lvl + 1]); continue; }
         if (e.name === B || e.name.startsWith(".") || e.name.endsWith(".tmp")) continue;
         const ext = path.extname(e.name).slice(1).toLowerCase();
-        if (!readables.has(ext) || e.name.endsWith(B)) continue;
-        if (hits.length >= 24) return;
+        if (!readables.has(ext)) continue;
+        try { if (fs.statSync(path.join(d, e.name)).size > 512000) continue; } catch { continue; }
+        filesRead++;
         try {
           const txt = fs.readFileSync(path.join(d, e.name), "utf8").slice(0, 500000);
-          txt.split("\n").forEach((l, i) => {
-            if (hits.length >= 24) return;
-            if (l.includes(B) && hits.length < 24) hits.push({ tgt: (rel ? rel + "\\" : "") + e.name, line: i + 1, txt: l.trim().slice(0, 90) });
-          });
+          let li = 0, pos = 0;
+          while (pos < txt.length && hits.length < 24) {
+            const nl = txt.indexOf("\n", pos);
+            const l = txt.slice(pos, nl === -1 ? txt.length : nl);
+            if (l.includes(B)) hits.push({ tgt: (rel ? rel + "\\" : "") + e.name, line: li + 1, txt: l.trim().slice(0, 90) });
+            if (nl === -1) break;
+            pos = nl + 1; li++;
+          }
         } catch { /* unreadable: skip file */ }
+        if (Date.now() - t0 > 400 || filesRead >= 2500) { partial = true; break; }
       }
-    };
-    walk(CWD, "");
+      await new Promise((r) => setImmediate(r));
+    }
     hits.sort((a, b) => a.tgt.localeCompare(b.tgt));
     UI.RADAR = { n: hits.length, top: hits.slice(0, 4), file: B, at: Date.now() };
-    addLog(cc(DIM, " radar fan-out: " + hits.length + " referencing " + clip(B, 24)));
+    addLog(cc(DIM, " radar fan-out: " + hits.length + " referencing " + clip(B, 24) + (partial ? " (partial scan)" : "")));
     if (hits.length) { for (const h of hits.slice(0, 3)) addLog(cc(DIM, "   \u21b3 " + clip(h.tgt + ":" + h.line, Math.max(40, UI.cols - PANEL_W - 16)) + " " + clip(h.txt, 44))); }
     else addLog(cc(DIM, "   (nothing imports " + clip(B, 20) + ")"));
   } catch (e) { addLog(cc(DIM, "   radar skipped: " + clip(String(e && e.message || e), 60))); }
