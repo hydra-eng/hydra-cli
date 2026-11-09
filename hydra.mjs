@@ -21,6 +21,7 @@ const BOLD = ESC + "[1m";
 const RESET = ESC + "[0m";
 // ---- palettes (/theme) â€” the UI reads these each frame, so switching is live
 const THEMES = {
+  orng:    { hi: "38;5;208", bg: "0;48;2;236;91;43", dim: "90" },   // opencode's signature orange on near-ink grays
   crimson: { hi: "91", bg: "0;48;2;220;20;60", dim: "90" },
   gold:    { hi: "93", bg: "0;48;2;191;144;0", dim: "93" },
   matrix:  { hi: "92", bg: "0;48;2;6;58;22", dim: "32" },
@@ -39,7 +40,7 @@ function applyTheme(name, persist = true) {
   }
   return true;
 }
-function activeTheme() { return (CFG && THEMES[CFG.theme] && CFG.theme) || "crimson"; }
+function activeTheme() { return (CFG && THEMES[CFG.theme] && CFG.theme) || "orng"; }
 const SPINNER_FRAMES = ["\u280B", "\u2819", "\u2839", "\u2838", "\u283C", "\u2834", "\u2826", "\u2827", "\u2807", "\u280F"];
 const ANSI_RX = new RegExp(ESC + "\\[[0-9;]*[a-zA-Z]", "g");
 const cc = (style, text) => (style ? style + text + RESET : text);
@@ -249,7 +250,7 @@ function loadCfg() {
   catch { CFG = defConfig(); }
   if (!CFG.providers || typeof CFG.providers !== "object") CFG.providers = {};
   if (!CFG.mcps || typeof CFG.mcps !== "object") CFG.mcps = {};
-  applyTheme(CFG.theme || "crimson", false);
+  applyTheme(CFG.theme || "orng", false);
   return CFG;
 }
 function saveCfg() {
@@ -827,7 +828,7 @@ function helpLines() {
     cc(DIM, " /rename <title>      rename the active session \u00b7 r in /sessions renames any"),
     cc(DIM, " /search <words>      scan all sessions, open hits in the browser dialog"),
     cc(DIM, " /fork <turn>         branch the chat up to that turn into a new session"),
-    cc(DIM, " /theme [name]        live palette swap \u00b7 crimson gold matrix ice mono"),
+    cc(DIM, " /theme [name]        live palette swap \u00b7 orng (opencode orange) crimson gold matrix ice mono"),
     cc(DIM, " /regen               regenerate the last reply \u00b7 /undo removes the last exchange"),
     cc(DIM, " /web <url>           fetch a web page into the conversation context"),
     cc(DIM, " /stats               turns \u00b7 approx tokens \u00b7 session/model/provider info"),
@@ -838,9 +839,9 @@ function helpLines() {
     cc(DIM, " @file.md             attach a file to your message (\u22644 files \u00b7 \u2264240 KB each)"),
     cc(DIM, " \u23f3 queueing           type + enter while a turn runs: your prompt waits, then runs"),
     cc(DIM, " todo tool            the model keeps a visible checklist for multi-step work"),
-    cc(DIM, " \u2398 copy / paste       drag-select copies paragraphs \u00b7 click grabs a row \u00b7 double-click a whole paragraph"),
-    cc(DIM, " ctrl+c               first press copies the selection / clears the prompt \u00b7 again exits"),
-    cc(DIM, " alt+c                copy the entire last reply (raw markdown, unmangled)"),
+    cc(DIM, " \u2398 copy / paste       drag to select (highlight stays) \u00b7 ctrl+shift+c copies it, browser-style"),
+    cc(DIM, " ctrl+c               first press clears the prompt \u00b7 again exits \u00b7 esc clears a selection"),
+    cc(DIM, " alt+c                copy the entire last reply (raw markdown) \u00b7 ctrl+a copy whole screen"),
     cc(DIM, " ctrl+v / shift+ins   paste the clipboard into the prompt (multi-line safe)"),
     cc(DIM, " /skills              list installed skills (agent + opencode/claude dirs)"),
     cc(DIM, " /learn <src>         distill text/url/file into a NEW skill (agent writes it)"),
@@ -1801,7 +1802,7 @@ function drawFrame() {
       e.cache = [];
       e.map = [];
       for (let pi = 0; pi < phys.length; pi++) {
-        const ws = wrapText(phys[pi], LW - 1);
+        const ws = wrapText(phys[pi], LW - 3);
         for (let wi = 0; wi < ws.length; wi++) {
           e.map.push({ e, pi, first: wi === 0, last: wi === ws.length - 1, para: paraOf[pi], boxed: boxed[pi] });
           e.cache.push(ws[wi]);
@@ -1817,7 +1818,7 @@ function drawFrame() {
     const fresh = NOW_MS - (e.t || 0) < 1500;   // brand-new rows leak in bright for a beat, then settle (log flash-in)
     let cvi = 0;
     for (const l of e.cache) {
-      scroll.push(fresh && cvi === 0 ? cc(CRIMSON + BOLD, "\u258e ") + l : l);
+      scroll.push(fresh && cvi === 0 ? cc(CRIMSON + BOLD, "\u258e ") + l : "  " + l);   // opencode-style: content sits 3 cols in
       SMETA.push(e.map && e.map[cvi] ? e.map[cvi] : null);
       cvi++;
     }
@@ -2573,7 +2574,6 @@ let SELECTION = null;   // {a:{r,c}, b:{r,c}} in screen cells while dragging
 let SCR = [];           // plain-text snapshot of the last frame (for drag-select copy)
 let SCRMETA = [];       // viewport-aligned line meta ( entry + physical line + para id ) for paragraph-aware copy
 let SCRVSTART = 0;
-let LAST_CLICK = null;  // { r, t } for double-click paragraph grab
 
 function plainRow(text, width) {
   const p = stripAnsi(text);
@@ -2628,15 +2628,6 @@ function selectionText(sel) {
   }
   flush();
   return parts.join("\n");
-}
-// double-click opens up: copy the WHOLE source paragraph under the cursor ( even the part scrolled off )
-function paragraphGrab(r) {
-  const m = SCRMETA[r];
-  if (!m || !m.e || !m.e.mdphys || m.para == null || m.para < 0 || !m.e.paraRange[m.para]) return "";
-  const e = m.e;
-  const [p0, p1] = e.paraRange[m.para];
-  const txt = mdJoinPhys(e.mdphys, p0, p1);
-  return txt.trim();
 }
 function copyLastReply() {
   const lu = [...HISTORY].reverse().find((m) => m.role === "assistant");
@@ -2694,33 +2685,9 @@ function mouseAction(btn, mx, my, rel) {
       } else if (SELECTION) { SELECTION.b = { r: my, c: mx }; scheduleDraw(true); }
     } else if (rel) {                                     // release
       if (SELECTION) {
-        const sel = SELECTION; SELECTION = null;
-        const clickOnly = sel.a.r === sel.b.r && sel.a.c === sel.b.c;
-        const now = Date.now();
-        let txt = "", desc = "the selection";
-        if (!clickOnly) {
-          txt = selectionText(sel);
-          LAST_CLICK = null;
-          desc = "the drag selection";
-        } else {
-          const dbl = LAST_CLICK && LAST_CLICK.r === sel.a.r && now - LAST_CLICK.t < 380;
-          if (dbl) {
-            txt = paragraphGrab(sel.a.r);
-            if (txt) { desc = "the paragraph"; }
-            else txt = "";   // not a mapped paragraph ( banner / rail ) -> fall through to the row grab
-          }
-          if (!txt) txt = chunkText(sel.a.r) || "";
-          if (txt && !dbl) desc = "the row";
-          LAST_CLICK = { r: sel.a.r, t: now };
-        }
-        if (txt) {
-          copyToClipboard(txt);
-          const lines = txt.split("\n").length;
-          addLog(cc(DIM, " \u2398 copied " + txt.length + " chars" + (lines > 1 ? " in " + lines + " lines" : "") + (desc === "the paragraph" ? " \u00b7 double-click grabs a whole paragraph" : desc === "the row" ? " \u00b7 a click grabs its row" : "") + " to clipboard"));
-          toast("copied \u00b7 " + txt.length + " chars");
-        } else if (!clickOnly) {
-          addLog(cc(DIM, " selection is empty \u00b7 drag across text, click a row, double-click a paragraph"));
-        }   // blank clicks stay silent
+        const clickOnly = SELECTION.a.r === SELECTION.b.r && SELECTION.a.c === SELECTION.b.c;
+        if (clickOnly) SELECTION = null;   // a plain click clears the highlight, exactly like a browser
+        // a drag keeps the paint ( highlight stays up ): ctrl+shift+c then copies it
         fullDraw = true; scheduleDraw(true);
       } else if (CLICK_ROW && CLICK_ROW.inDlg) {
         const same = CLICK_ROW.r === my;
@@ -2785,6 +2752,15 @@ function onKey(str, key) {
         MOUSE_FRAG = false; MOUSE_BUF = "";
         mouseAction(btn, mx, my, str === "m");
       }
+      return;
+    }
+    if (key && key.ctrl && key.shift && key.name === "c") {   // ctrl+shift+c: browser-style copy of the painted selection
+      if (SELECTION) {
+        const txt = selectionText(SELECTION);
+        if (txt) { copyToClipboard(txt); toast("copied selection \u00b7 " + txt.length + " chars"); }
+        else toast("selection is empty \u00b7 drag across text first");
+        fullDraw = true; scheduleDraw(true);
+      } else toast("drag to select text \u00b7 ctrl+shift+c copies \u00b7 alt+c copies the last reply");
       return;
     }
     if (key && (key.alt || key.meta) && key.name === "c") { copyLastReply(); return; }   // alt+c: one stroke copies the whole last reply ( Node gives ESC-key as meta, not alt )
@@ -3350,7 +3326,8 @@ async function main() {
       setTimeout(() => { "/theme".split("").forEach((c) => send(c)); }, 2200);
       setTimeout(() => send("", { name: "return" }), 2600);        // theme popup
       setTimeout(() => send("", { name: "down" }), 2900);          // gold
-      setTimeout(() => send("", { name: "down" }), 3000);          // matrix (third)
+      setTimeout(() => send("", { name: "down" }), 3000);          // (orng added -> list shifted one)
+      setTimeout(() => send("", { name: "down" }), 3050);          // matrix (fourth)
       setTimeout(() => send("", { name: "return" }), 3100);        // apply + save
       tEnd = 5600;
     }
