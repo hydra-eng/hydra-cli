@@ -635,7 +635,21 @@ async function agentLoop(question, provider, ondelta, onTool, history, signal, n
   let finalText = "";
   let exhausted = true;
   for (let step = 0; step < MAX_STEPS; step++) {
-    const out = await chatOnce(messages, provider, ondelta, signal, noTools);
+    // transient network hiccups ( LAN blips, ECONNRESET mid-stream, keep-alive/pend drops ) retry
+    // per round instead of ending the turn as "turn error" — the old behaviour stopped the work
+    // halfway for a failure the next second would have survived. aborts (esc) never retry, and
+    // "model timed out" stays surfaced ( a silent provider is a judgement call, not a blip ).
+    let out = null;
+    for (let att = 0; ; att++) {
+      try { out = await chatOnce(messages, provider, ondelta, signal, noTools); break; }
+      catch (e) {
+        if (signal?.aborted || e.name === "TimeoutError" || att >= 2) throw e;
+        const hay = (e.message || "") + " " + ((e.cause && (e.cause.message || e.cause.code)) || "");
+        if (!/terminated|fetch failed|econnreset|econnrefused|socket hang up|epipe|other side closed|network|underlying socket/i.test(hay)) throw e;
+        addLog(cc(DIM, " stream hiccup and retry " + (att + 1) + " of 2 { " + clip(String(e.message || e), 60) + "}"));
+        await new Promise((r) => setTimeout(r, 900 * (att + 1)));
+      }
+    }
     finalText = out.content;
     messages.push({ role: "assistant", content: out.content, ...(out.tool_calls ? { tool_calls: out.tool_calls } : {}) });
     if (!out.tool_calls || signal?.aborted) {
@@ -3016,9 +3030,13 @@ function tuiSession() {
   enterTUI();
   splashThenBoot();
   process.on("exit", () => { try { saveSession(); process.stdout.write(ESC + "[?25h" + ESC + "[?1000l" + ESC + "[?1006l" + ESC + "[?2004l" + ESC + "[?1049l"); } catch { /* nop */ } });
-  process.stdin.on("keypress", onKey);
+  // wrap the key handler: a throw from ANY weird key/mouse event used to bubble out uncaught and
+  // kill the whole app mid-task ( crashes ARE a way the "model stops in between" ) — now the app
+  // logs it and keeps going. the exit handler also restores the 1002 mouse mode we switched on.
+  process.stdin.on("keypress", (s, k) => { try { onKey(s, k); } catch (e) { crashLog(e); scheduleDraw(); } });
   process.stdin.on("error", () => { /* nop */ });
   process.on("SIGINT", () => process.exit(0));
+  process.on("exit", () => { try { saveSession(); process.stdout.write(ESC + "[?25h" + ESC + "[?1000l" + ESC + "[?1002l" + ESC + "[?1006l" + ESC + "[?2004l" + ESC + "[?1049l"); } catch { /* nop */ } });
   fullDraw = true;
   scheduleDraw(true);
 }
