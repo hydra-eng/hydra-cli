@@ -289,13 +289,28 @@ async function runToolCall(tc, signal) {
   let result = "";
   try {
     if (tc.function?.name === "bash") {
-      const r = await runBash(String(args.command || ""), TOOL_TIMEOUT, signal);
-      if (r.failed === "denied") {
-        result = "BLOCKED by hydra sandbox (mode " + SANDBOX_MODE() + ") - the command was NOT run. Use a safer approach, or tell the user they can approve it by running it with ! themselves.";
+      let cmd = String(args.command || "");
+      const zone = ruleZone(cmd);
+      if (zone === "deny") {
+        result = "BLOCKED by zone rules (deny) - the command was NOT run. /rules lists the active zones; ask the user to allow it in .agentrules.";
+        addLog(cc(CRIMSON + BOLD, " \u26d4 zone deny: ") + cc(DIM, clip(cmd, 60)));
+      } else if (zone === "ask") {
+        const ok = await askUserConfirm(" zone ask: " + clip(cmd, 90), 120000);
+        if (!ok) {
+          result = "The command was NOT run - zone rules asked the user and they said no.";
+          addLog(cc(CRIMSON + BOLD, " \u26d4 zone said no") + cc(DIM, " (y in .agentrules to auto-allow)"));
+        }
       } else {
-        const code = r.status !== undefined ? r.status : r.code;
-        result = ((r.out !== undefined ? r.out : r.stdout || "") + ((r.err !== undefined ? r.err : r.stderr) ? "\n[stderr] " + (r.err !== undefined ? r.err : r.stderr) : "")).trim();
-        if (code) result += `[exit ${code}]`;
+        if (zone === "allow") addLog(cc(DIM, " \u2705 zone allow"));
+        const r = await runBash(cmd, TOOL_TIMEOUT, signal);
+        if (r.failed === "denied") {
+          result = "BLOCKED by hydra sandbox (mode " + SANDBOX_MODE() + ") - the command was NOT run. Use a safer approach, or tell the user they can approve it by running it with ! themselves.";
+        } else {
+          const code = r.status !== undefined ? r.status : r.code;
+          result = ((r.out !== undefined ? r.out : r.stdout || "") + ((r.err !== undefined ? r.err : r.stderr) ? "\n[stderr] " + (r.err !== undefined ? r.err : r.stderr) : "")).trim();
+          diagProbe(cmd, result, code);   // failing output becomes a diagnostic card ( /diag, /fix )
+          if (code) result += `[exit ${code}]`;
+        }
       }
     } else if (tc.function?.name === "skill_load") {
       const body = readSkillBody(args.name, 8000);
@@ -330,6 +345,7 @@ async function runToolCall(tc, signal) {
       const headLines = String(args.content ?? "").split("\n").filter(Boolean).slice(0, 2);
       addLog(cc(DIM, " write " + shortPath(p) + " \u00b7 " + bodyLines + " lines"));
       for (const l of headLines) addLog(cc(DIM, "   + " + clip(l, 78)));
+      radarScan(p);   // dependency radar: who else points at this file
     } else if (tc.function?.name === "edit") {
       const p = path.resolve(CWD, args.filePath);
       const src = fs.readFileSync(p, "utf8");
@@ -339,6 +355,7 @@ async function runToolCall(tc, signal) {
       addLog(cc(DIM, " edit " + shortPath(p) + " (" + String(args.oldString || "").split("\n").length + "- \u2192 " + String(args.newString ?? "").split("\n").length + "+ lines)"));
       for (const d of String(args.oldString || "").split("\n").slice(0, 4)) addLog(cc(DIM, "   - " + clip(d, 78)));
       for (const s of String(args.newString ?? "").split("\n").slice(0, 4)) addLog(cc(CRIMSON, "   + " + clip(s, 78)));
+      radarScan(p);
     } else if (tc.function?.name === "todo_write") {
       const arr = Array.isArray(args.items) ? args.items.slice(0, 12) : [];
       UI.TODOS = arr.map((x) => ({ text: String((x && x.text) || "").slice(0, 120), done: !!((x && x.done)) }));
@@ -630,8 +647,14 @@ function inlineAttach(q) {
 async function agentLoop(question, provider, ondelta, onTool, history, signal, noTools, extraSystem) {
   const sys = SYS() + (noTools ? "\nPLAN MODE: Discuss and advise only. Do NOT call any tools this turn." : "") + (extraSystem ? "\n\n" + extraSystem : "");
   const hist = history || [];
-  const face = hist.length > MODEL_KEEP ? hist.slice(-MODEL_KEEP) : hist;   // provider sees the tail; the full total stays in history + the session file
-  const messages = [{ role: "system", content: sys }, ...face, { role: "user", content: question }];
+  const b = budgetFace(hist === HISTORY ? null : hist);   // parked turns (/ctx) are skipped + a token cap trims the window; full history stays in the session file
+  const messages = [
+    { role: "system", content: sys },
+    ...(b.dropped.trim ? [{ role: "user", content: "[context: " + b.dropped.trim + " older message" + (b.dropped.trim === 1 ? "" : "s") + " trimmed to fit the budget \u00b7 titled turns are in /time]" }] : []),
+    ...b.face,
+    ...(b.dropped.park ? [{ role: "user", content: "[context: " + b.dropped.park + " earlier turn" + (b.dropped.park === 1 ? "" : "s") + " parked out of context by the user \u00b7 /ctx brings them back]" }] : []),
+    { role: "user", content: question },
+  ];
   let finalText = "";
   let exhausted = true;
   for (let step = 0; step < MAX_STEPS; step++) {
@@ -651,6 +674,7 @@ async function agentLoop(question, provider, ondelta, onTool, history, signal, n
       }
     }
     finalText = out.content;
+    if (out.content) UI.TOKENS += Math.max(1, Math.round(String(out.content).length / 4));   // approx reply tokens this session ( footer "tok" )
     messages.push({ role: "assistant", content: out.content, ...(out.tool_calls ? { tool_calls: out.tool_calls } : {}) });
     if (!out.tool_calls || signal?.aborted) {
       if (history) {
@@ -846,6 +870,15 @@ const COMMANDS = [
   { name: "/hub", desc: "browse + install hub skills", hint: "" },
   { name: "/memory", desc: "show/clear durable memory", hint: " [clear]" },
   { name: "/sandbox", desc: "ask|strict|open command gating", hint: "" },
+  { name: "/ctx", desc: "park/restore turns (ctrl+g)", hint: "" },
+  { name: "/purge", desc: "compact stale exchanges", hint: " [keep]" },
+  { name: "/time", desc: "checkpoint rewind dialog", hint: "" },
+  { name: "/rec", desc: "start/stop macro recording (ctrl+r)", hint: " [name]" },
+  { name: "/macro", desc: "replay a recorded macro skill", hint: " <name>" },
+  { name: "/zone", desc: "permission zones (.agentrules)", hint: "" },
+  { name: "/diag", desc: "diagnostic cards from failures", hint: "" },
+  { name: "/fix", desc: "auto-fix the first diag card", hint: "" },
+  { name: "/lane", desc: "split-agent lane B (grid)", hint: " start|stop" },
   { name: "/skills-safe", desc: "gate agent skill writes", hint: "" },
   { name: "/skill-del", desc: "stash a hydra skill", hint: " <name>" },
   { name: "/help", desc: "all commands", hint: "" },
@@ -891,6 +924,14 @@ function helpLines() {
     cc(DIM, " /hub                 browse + install community skills (secret scan at install)"),
     cc(DIM, " /memory              show what the agent remembered \u00b7 /memory clear wipes it"),
     cc(DIM, " /sandbox ask|strict|open  gate risky commands behind y/n (default ask)"),
+    cc(DIM, " /zone /rules        workspace permission zones \u00b7 .agentrules: deny/ask/allow <pattern>"),
+    cc(DIM, " ctrl+p govern       context picker: park turns \u00b7 purge stale \u00b7 time travel \u00b7 diag"),
+    cc(DIM, " /ctx / ctrl+g       park or restore whole turns from the model window"),
+    cc(DIM, " /purge [keep]       compact stale exchanges (checkpoints keep it reversible via /time)"),
+    cc(DIM, " /time               checkpoint rewind dialog \u2009\u00b7\u2009enter rewinds history to that point"),
+    cc(DIM, " ctrl+r \u00b7 /rec       record the agent's shell steps as a macro skill \u00b7 /macro <name> replays"),
+    cc(DIM, " /diag \u00b7 /fix        failing tool output becomes a diagnostic card \u00b7 /fix runs a heuristic"),
+    cc(DIM, " /lane start <task>  split-agent grid: the second lane streams into the same body \u00b7 esc stops"),
     cc(DIM, " /skills-safe on|off  require your approval for agent skill writes"),
     cc(DIM, " /skill-del <name>    stash a hydra skill (u-restorable pattern in .trash)"),
     "",
@@ -977,6 +1018,12 @@ const UI = {
   TODOS: [],    // the model's visible checklist (todo_write tool), {text, done}
   TOAST: null,  // { text, until } — short notification card shown above the composer
   CC_TS: 0,     // last ctrl+c timestamp (double-press to exit, claude-code style)
+  GHOST: "",    // ghost-write completion shown after the caret; tab accepts
+  TOKENS: 0,    // approx cumulative reply tokens this session ( telemetry footer )
+  TPS: null,    // streaming speed telemetry { c, t, t0 } while a reply streams
+  REC: { on: false, last: null },   // macro recording ( ctrl+r ), command steps captured while on
+  RADAR: null,  // dependency fan-out radar for the last edited/written file
+  LANES: { abort: null },   // split-agent grid: second lane ( /lane start )
 };
 
 function centerText(text, width) {
@@ -1078,7 +1125,28 @@ function addLog(text) {
 }
 function toast(text, ms) { UI.TOAST = { text: String(text || ""), until: Date.now() + (ms || 2600) }; scheduleDraw(); }
 function addLogLines(lines) { for (const l of lines || []) addLog(l); }
-function setUserInput(v) { UI.input = v; syncSlashPopup(); UI.scroll = 0; scheduleDraw(); }
+// ---- ghost-write completion: the newest prompt-history (or chat-history) continuation shown after the caret, tab accepts
+function updateGhost() {
+  const q = UI.input;
+  let g = "";
+  const ql = String(q || "").toLowerCase();
+  if (ql.length >= 2 && !q.startsWith("/") && !q.includes("\n")) {
+    for (let i = PROMPT_HIST.length - 1; i >= 0; i--) {
+      const h = String(PROMPT_HIST[i] || "");
+      if (h.toLowerCase().startsWith(ql) && h.length > q.length) { g = h.slice(q.length); break; }
+    }
+    if (!g) {
+      for (const m of HISTORY) {
+        if (m.role !== "user") continue;
+        const c = String(m.content || "");
+        if (c.startsWith("[skill") || c.startsWith("[web:") || c.startsWith("[attached") || c.startsWith("[context")) continue;
+        if (c.toLowerCase().startsWith(ql) && c.length > q.length && c.length < 2400) { g = c.slice(q.length); break; }
+      }
+    }
+  }
+  UI.GHOST = String(g || "").replace(/\n+/g, " ").replace(/\s+/g, " ").slice(0, 300);
+}
+function setUserInput(v) { UI.input = v; updateGhost(); syncSlashPopup(); UI.scroll = 0; scheduleDraw(); }
 
 function nudgeScroll(n) {
   UI.scroll = Math.max(0, UI.scroll + n);
@@ -1151,7 +1219,8 @@ function relTime(iso) {
 function previewLines(file, prevW) {
   const outp = [];
   try {
-    let rawP = fs.readFileSync(path.join(sessionsDir(), String(file)), "utf8");
+    const isTime = UI.dialog && UI.dialog.isTime;
+    let rawP = fs.readFileSync(path.join(isTime ? CHK_DIR() : sessionsDir(), String(file)), "utf8");
     if (rawP.charCodeAt(0) === 0xFEFF) rawP = rawP.slice(1);
     const j = JSON.parse(rawP);
     const hist = Array.isArray(j.history) ? j.history : [];
@@ -1161,6 +1230,7 @@ function previewLines(file, prevW) {
     outp.push(cc(DIM, " " + relTime(j.when) + " \u00b7 " + umsgs.length + " prompts \u00b7 " + amsgs.length + " replies"));
     const p = j.provider || j.model ? (j.provider || "") + (j.model ? " \u00b7 " + j.model : "") : "";
     if (p) outp.push(cc(DIM, " " + clip(p, prevW - 2)));
+    if (isTime) outp.push(cc(DIM, " checkpoint \u00b7 enter rewinds history to this point"));
     outp.push("");
     const show = hist.filter((m) => !String(m.content || "").startsWith("[skill")).slice(-14);
     for (const m of show) {
@@ -1203,6 +1273,7 @@ function dialogActivate() {
   const it = d.items[d.sel];
   closeDialog();
   if (it && it.value) {
+    if (d.isTime) { restoreCheckpoint(it.value); return; }   // time travel rewinds straight from the dialog
     if (String(it.value) === ACTIVE_SESSION_FILE) { addLog(cc(DIM, " (that is already the active session \u00b7 your chat is right here)")); scheduleDraw(true); }
     else loadSessionFile(it.value);   // auto-queues if a turn is busy
   }
@@ -1288,6 +1359,27 @@ function popupActivate() {
   if (kind === "skills") { injectSkillValue(it.value); return; }
   if (kind === "hub") { hubInstall(Number(it.value)); return; }
   if (kind === "theme") { applyTheme(String(it.value)); addLog(cc(CRIMSON + BOLD, "  palette -> " + it.value + " \u00b7 applies instantly, saved to config")); scheduleDraw(true); return; }
+  if (kind === "ctx") {
+    const i = Number(it.value) || 0;
+    if (CTX.excl.has(i)) {
+      CTX.excl.delete(i); CTX.excl.delete(i + 1);
+      addLog(cc(CRIMSON + BOLD, " \u21a9 turn " + (i / 2 + 1) + " back in context"));
+    } else {
+      CTX.excl.add(i); CTX.excl.add(i + 1);
+      addLog(cc(CRIMSON + BOLD, " \u21dd turn " + (i / 2 + 1) + " parked") + cc(DIM, " \u00b7 prompts get slimmer \u00b7 enter again brings it back"));
+      saveSession();
+    }
+    scheduleDraw(true);
+    return;
+  }
+  if (kind === "govern") {
+    if (it.value === "ctx") { openCtxPicker(); return; }
+    if (it.value === "purge") { purgeStale(""); return; }
+    if (it.value === "time") { openTimeDialog(); return; }
+    if (it.value === "stats") addLogLines(statsLines());
+    if (it.value === "diag") addLogLines(diagLines());
+    return;
+  }
   if (t === "slash") { setUserInput((it.value || stripAnsi(it.label)).trim() + " "); syncSlashPopup(); return; }
 }
 const TRASH_DIR = () => path.join(sessionsDir(), ".trash");
@@ -1411,7 +1503,13 @@ function panelTexts() {
     cc(DIM, "deep    " + (DEEP_SHELL.child ? "live" : "off")),
     cc(DIM, "memory  " + cachedCount("memory", memoryFactsCount)),
     cc(DIM, "lessons " + cachedCount("lessons", lessonCount)),
-    cc(DIM, "ctx     " + ctxK()),
+    cc(DIM, "ctx     " + ctxK() + (CTX.excl.size ? "*" : "")),
+    ...(UI.RADAR ? [
+      cc(DIM, "radar   " + UI.RADAR.n + (UI.RADAR.n ? " hits" : " 0")),
+      ...(UI.RADAR.n ? [cc(CRIMSON, " fan-out " + clip(UI.RADAR.file || "", 14))] : []),
+    ] : []),
+    ...(UI.TOKENS ? [cc(DIM, "tok     " + Math.min(999999, UI.TOKENS))] : []),
+    ...(UI.REC.on ? [cc("\u001b[31m", "rec     ON")] : []),
     ...(UI.TODOS.length ? [
       cc(UI.TODOS.some((t) => !t.done) ? CRIMSON + BOLD : DIM, "todo    " + UI.TODOS.filter((t) => !t.done).length + "/" + UI.TODOS.length),
       // opencode-style checklist on the rail: pending bold, the first open one is the current task, done dims out
@@ -1425,15 +1523,84 @@ function panelTexts() {
   ];
 }
 const _COUNT_CACHE = { sessions: { v: 0, t: 0 }, skills: { v: 0, t: 0 }, mcps: { v: 0, t: 0 }, memory: { v: 0, t: 0 }, lessons: { v: 0, t: 0 } };
-// rough context-size gauge (chars/4 ≈ tokens) over the live turn history — ai-cli style "ctx" readout
+// ---- context governance: budget meter, parked turns ( ctrl+p /govern picker ), /purge gc ----
+const CTX = { excl: new Set(), maxK: 0, last: null };   // excl = HISTORY indexes of parked (user+assistant) pairs
+function ctxFaceLive() {
+  const h = HISTORY, out = [];
+  for (let i = 0; i < h.length; i++) if (!CTX.excl.has(i)) out.push(h[i]);
+  return out;
+}
+function faceTokens(f) {
+  let c = 0;
+  for (const m of f) c += String((m && m.content) || "").length;
+  return Math.round(c / 4);
+}
+function budgetFace(history) {
+  const hist = history || HISTORY;
+  const live = [];
+  for (let i = 0; i < hist.length; i++) if (!(history ? false : CTX.excl.has(i))) live.push(hist[i]);
+  let face = live.length > MODEL_KEEP ? live.slice(-MODEL_KEEP) : live;
+  const dropped = { trim: live.length - face.length, park: history ? 0 : Math.floor(CTX.excl.size / 2) };
+  let tok = faceTokens(face);
+  const cap = Math.max(2000, (Number(process.env.HYDRA_CTX_MAX) || 0) || ((CTX.maxK || 0) * 1000) || 60000);
+  while (face.length > 2 && tok > cap) {
+    const gone = face.shift();
+    tok = Math.max(0, Math.round(tok - String((gone && gone.content) || "").length / 4));
+    dropped.trim++;
+  }
+  const out = { face, tok, cap, dropped };
+  if (!history) CTX.last = out;
+  return out;
+}
+// rough context-size gauge (chars/4 ≈ tokens) over the live model window — ai-cli style "ctx" readout
 function ctxTokens() {
-  let chars = 0;
-  for (const m of HISTORY.slice(-32)) chars += String((m && m.content) || "").length;
-  return Math.round(chars / 4);
+  const b = budgetFace();
+  return b ? b.tok : 0;
 }
 function ctxK() {
   const tk = ctxTokens() / 1000;
   return tk >= 1000 ? (tk / 1000).toFixed(1) + "m" : Math.round(tk) + "k";
+}
+// /purge: keep the head + tail of stale exchanges, replace the middle with a marker ( tokens are reclaimed, the gist stays )
+function purgeKeepHeadTail(i, head, tail) {
+  if (HISTORY[i] && HISTORY[i].content) HISTORY[i].content = String(HISTORY[i].content).slice(0, head) + (tail ? "```+ " + String(HISTORY[i].content).slice(-tail) : "") + " … [head/tail kept by /purge]";
+  if (HISTORY[i + 1] && HISTORY[i + 1].content) HISTORY[i + 1].content = String(HISTORY[i + 1].content).slice(0, head) + " … [head kept by /purge]";
+}
+function boardExchanges() {   // exchanges (index i => HISTORY[i], i+1) with sizes + staleness, oldest first
+  const out = [];
+  for (let i = 0; i < HISTORY.length; i += 2) {
+    const u = String((HISTORY[i] || {}).content || "");
+    const a = String((HISTORY[i + 1] || {}).content || "");
+    out.push({ i, turn: i / 2 + 1, size: u.length + a.length, head: clip(u.replace(/\s+/g, " ").trim(), 60), parked: CTX.excl.has(i) });
+  }
+  return out;
+}
+// /purge [keep]: compacts stale exchanges ( everything older than the last 3 turns ) to their heads — a checkpoint first, so it is reversible via /time
+function purgeStale(argn) {
+  if (UI.busy) { addLog(cc(DIM, " wait for the turn to finish (or esc) \u00b7 then /purge")); return; }
+  const keep = Math.max(80, parseInt(argn, 10) || 300);
+  let done = 0, before = 0;
+  const cutoff = Math.max(0, HISTORY.length - 6);   // the last 3 exchanges always stay whole
+  const bodied = boardExchanges().filter((x) => x.i + 2 <= cutoff && !x.parked && x.size >= 800);
+  if (!bodied.length) { addLog(cc(DIM, " nothing stale to purge \u00b7 the last 3 turns always stay whole \u00b7 a /time checkpoint covers the purge")); return; }
+  saveCheckpoint(false);
+  before = HISTORY.reduce((a, m) => a + String((m && m.content) || "").length, 0);
+  for (const x of bodied) purgeKeepHeadTail(x.i, keep, Math.max(0, keep - 60));
+  const after = HISTORY.reduce((a, m) => a + String((m && m.content) || "").length, 0);
+  addLog(cc(CRIMSON + BOLD, " \u25bd purged " + bodied.length + " stale exchanges") + cc(DIM, " \u00b7 " + Math.round(before / 4) + " \u2192 " + Math.round(after / 4) + " tokens \u00b7 full text is one \u21bb in /time away"));
+  scheduleDraw(true);
+}
+// ctrl+p /govern picker: the context-control surface ( fig 5 ) on a popup
+function openGovernPicker() {
+  const b = budgetFace();
+  const items = [
+    { label: "park turns " + cc(DIM, "\u00b7 slim prompts"), desc: " /ctx picker \u00b7 " + Math.floor(CTX.excl.size / 2) + " parked now", value: "ctx" },
+    { label: "purge stale " + cc(DIM, "\u00b7 reclaim"), desc: " /purge \u00b7 " + b.tok + "/1000 tok in the window", value: "purge" },
+    { label: "time travel " + cc(DIM, "\u00b7 rewind"), desc: " /time \u00b7 checkpoints dir", value: "time" },
+    { label: "stats " + cc(DIM, "\u00b7 usage"), desc: " /stats \u00b7 session tokens", value: "stats" },
+    { label: "diag " + cc(DIM, "\u00b7 failures"), desc: " /diag \u00b7 " + (DIAG.length ? "cards open ( /fix runs a heuristic )" : "no cards"), value: "diag" },
+  ];
+  openPopup("govern \u2502 enter opens the tool \u00b7 esc close", items);
 }
 function cachedCount(kind, fn) {
   const c = _COUNT_CACHE[kind];
@@ -1664,6 +1831,7 @@ class DeepShell {
 const DEEP_SHELL = new DeepShell();
 // one bash call: sandbox gate first, then persistent shell (single-line) with fresh-shell fallback
 async function runBash(cmd, timeoutMs, signal) {
+  recBash(cmd);   // macro recording watches every planned shell step
   const mode = SANDBOX_MODE();
   if (mode !== "open" && isRisky(cmd)) {
     const ok = await askUserConfirm(String(cmd || "").trim().slice(0, 120), 120000, signal);
@@ -1677,6 +1845,191 @@ async function runBash(cmd, timeoutMs, signal) {
     }
   }
   return runShellAsync(cmd, CWD, timeoutMs, signal);
+}
+
+// ---- permission zones (.agentrules): the user's own red/yellow/green file for what bash may run
+// first matching rule wins: `deny <pattern>` blocks, `ask <pattern>` confirms, `allow <pattern>` runs even in a strict sandbox
+let _ZONE_CACHE = { t: 0, z: null };
+function loadZones() {
+  if (Date.now() - _ZONE_CACHE.t > 4000) {
+    const z = [];
+    for (const p of [path.join(CWD, ".agentrules"), path.join(CFG_DIR, ".agentrules")]) {
+      try {
+        for (const l of fs.readFileSync(p, "utf8").split(/\r?\n/)) {
+          const s = l.trim();
+          if (!s || s.startsWith("#")) continue;
+          const kw = (s.match(/^(deny|ask|allow)\b/i) || [])[1];
+          if (kw) z.push({ kind: kw.toLowerCase(), rx: s.replace(/^[a-zA-Z]+\s*/, "").trim(), dir: p });
+        }
+      } catch { /* no rules file here */ }
+      if (z.length) break;   // workspace rules shadow the global ones
+    }
+    _ZONE_CACHE = { t: Date.now(), z };
+  }
+  return _ZONE_CACHE.z;
+}
+function ruleZone(cmd) {
+  const z = loadZones();
+  if (!z) return null;
+  const s = String(cmd || "");
+  for (const r of z) {
+    let rx = null;
+    try { rx = new RegExp(r.rx, "i"); } catch { continue; }
+    if (rx.test(s)) return r.kind;
+  }
+  return null;
+}
+function zoneLines() {
+  const z = loadZones() || [];
+  return [" Zones (" + (z.length ? (z[0].dir === path.join(CWD, ".agentrules") ? shortPath(path.join(CWD, ".agentrules")) : shortPath(z[0].dir)) : "no .agentrules found") + "):",
+    ...(z.length ? z.slice(0, 24).map((r) => cc(DIM, "  " + r.kind.padEnd(6)) + cc(CRIMSON, r.rx)) : [" " + cc(DIM, " deny/ask/allow <pattern> \u00b7 first match wins")])];
+}
+
+// ---- macro recording: ctrl+r starts grabbing every bash step the agent runs; /rec stop compiles it into a reusable skill ----
+const REC = { on: false, items: [], ts: 0, last: null };
+function recStart() {
+  REC.on = true; REC.items = []; REC.ts = Date.now();
+  addLog(cc(CRIMSON + BOLD, " \u25cf recording \u00b7 every shell step hydra runs is captured") + cc(DIM, " \u00b7 ctrl+r again (or /rec) to compile it into a skill"));
+  scheduleDraw();
+}
+function recBash(cmd) { if (REC.on && cmd) REC.items.push(String(cmd).slice(0, 500)); }
+async function recStop(askKeep) {
+  if (!REC.on) { addLog(cc(DIM, " not recording \u00b7 ctrl+r starts a macro")); return; }
+  const n = REC.items.length;
+  REC.on = false;
+  if (!n) { addLog(cc(DIM, " recording stopped \u00b7 no steps captured")); return; }
+  const slug = safeSkillName("macro-" + (askKeep ? String(askKeep).replace(/[^a-z0-9]+/gi, "-").slice(0, 24) : "capture-" + String(RREC_TS()).slice(-4)));
+  const body = ["# Macro (auto-recorded by hydra)", "",
+    "The user hit ctrl+r and I ran the following shell steps in order. Reproduce them EXACTLY with the bash tool when asked to repeat this workflow:",
+    "",
+    ...REC.items.map((c, i) => (i + 1) + ". `" + c.replace(/`/g, "'") + "`"),
+    "",
+    "Run them one at a time; stop if a step fails and say which one."].join("\n");
+  const file = skillFile(slug);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    atomicWrite(file, "---\nname: " + slug + "\ndescription: recorded macro with " + n + " shell steps (macros capture workflows in real time)\n---\n\n" + body + "\n");
+    REC.last = slug;
+    addLog(cc(CRIMSON + BOLD, " \u2b1c macro skill saved: " + slug) + cc(DIM, " \u00b7 " + n + " steps \u00b7 say \u201cmacro " + slug + "\u201d to replay it"));
+    scheduleDraw(true);
+  } catch (e) { addLog(cc("\u001b[31m", " macro save failed: " + (e.message || e))); }
+}
+function RREC_TS() { return Date.now().toString(36); }
+async function macroRun(name) {
+  const slug = safeSkillName(name);
+  const body = slug ? readSkillBody(slug, 20000) : "";
+  if (!body || !/macro|shell|steps/i.test(body + slug)) {
+    addLog(cc(DIM, " no macro skill named \u201c" + (name || "?") + "\u201d \u00b7 ctrl+r records one, /rec compiles it"));
+    return;
+  }
+  addLog(cc(CRIMSON + BOLD, " \u25b6 replaying macro: ") + slug);
+  await runAgentTurn("Replay the skill \u201c" + slug + "\u201d: follow its numbered steps with the bash tool exactly, in order, reporting each step result in one short line. The skill body is loaded automatically since my message started with its name.");
+}
+
+// ---- split-agent lane B ( the grid's second worker ): its own history clone, its own abort, deltas stamped into the shared body
+function laneStop(quiet) {
+  const L = UI.LANES;
+  if (!L.abort) { if (!quiet) addLog(cc(DIM, " no lane running \u00b7 /lane start <task> spawns one")); return; }
+  try { L.abort.abort(); } catch { /* nop */ }
+}
+async function laneStart(q) {
+  const L = UI.LANES;
+  if (L.abort) { addLog(cc(DIM, " lane B is already running \u00b7 /lane stop first")); return; }
+  if (!q) { addLog(cc(DIM, " /lane start <task> \u00b7 \u00b7 the task runs on lane B while lane A keeps yours \u00b7 esc or /lane stop ends it")); return; }
+  if (UI.busy) { addLog(cc(DIM, " lane A is mid-turn \u00b7 lane B can start alongside after it \u00b7 try again then")); return; }
+  const histB = HISTORY.slice(0);   // independent clone: lane B works on a snapshot, never mutates lane A's context
+  const ab = new AbortController();
+  L.abort = ab;
+  addLog(cc(CRIMSON + BOLD, " \u26a1 lane B started \u00b7 ") + clip(q, 64) + cc(DIM, " \u00b7 its own context clone \u00b7 ESC ends it"));
+  try {
+    const out = await agentLoop(q, activeProvider(),
+      (t) => addLog(cc("\u001b[38;5;141m", "" ) + cc(DIM, " \u2039b\u203a ") + t),
+      (tool) => addLog(cc("\u001b[38;5;141m", "   > lane: ") + cc(DIM, truncateLine(tool, Math.max(30, UI.cols - PANEL_W - 12)))),
+      histB, ab.signal, false,
+      "[grid lane B: you are posting into a SPLIT-AGENT GRID. Reply tight (<=300 words); the user watches lane A's text as the master draft; your work extends it.]");
+    if (L.abort === ab) { addLog(cc("\u001b[38;5;141m", " \u26a1 lane B done \u00b7 ") + cc(DIM, stripAnsi(out).length + " chars (its clone is not merged into lane A's history \u00b7 reference it by asking)")); L.abort = null; }
+  } catch (e) {
+    if (L.abort === ab) { addLog(ab.signal.aborted ? cc("\u001b[38;5;141m", " \u26a1 lane B stopped by you") : cc("\u001b[31m", " lane B failed: " + (e.message || e))); L.abort = null; }
+  }
+  if (L.abort === ab) L.abort = null;
+}
+
+// ---- diagnostic cards: failing tool output is parsed into one-line cards; a built-in fixer patches common breakage
+let DIAG = [];
+function diagProbe(cmd, text, code) {
+  const s = String(text || "");
+  if (!s) return;
+  const rx = /^(.*?error:.*)|^(.*?uncaught .*)|^(.*?cannot find.*)|^(.*?enoent.*)|^(.*?traceback.*)/im;
+  const m = rx.exec(s) || (code ? null : null);
+  if (!m) return;
+  const c = { text: clip(String(m[0]).replace(/\s+/g, " ").trim(), 90) + (code ? " (exit " + code + ")" : ""), cmd: clip(String(cmd || ""), 40), at: Date.now() };
+  DIAG = [c, ...DIAG].slice(0, 5);
+  addLog(cc(CRIMSON + BOLD, " \u26a0 diag card: ") + cc(DIM, c.text + " \u00b7 /fix helps"));
+  scheduleDraw();
+}
+function diagLines() {
+  if (!DIAG.length) return [" " + cc(DIM, " no diagnostic cards (they appear for failing tool output)")];
+  return DIAG.map((c, i) => " " + cc(CRIMSON, " \u26a0 card " + (i + 1) + ": ") + cc(DIM, c.text + " \u00b7 from " + c.cmd));
+}
+// one-shot heuristic fixer: patch common failure families ( missing npm module ), dismiss everything else with guidance
+async function diagFix() {
+  if (!DIAG.length) { addLog(cc(DIM, " nothing to fix \u00b7 no open diagnostic cards")); return; }
+  const c = DIAG[0];
+  c.tries = (c.tries || 0) + 1;
+  if (c.tries > 3) {
+    DIAG = DIAG.filter((x) => x !== c);
+    addLog(cc(DIM, " diag card parked (3 fix attempts) \u00b7 it will not nag again"));
+    scheduleDraw(true);
+    return;
+  }
+  const mod = /cannot find module '([^']+)'/.exec(String(c.text || ""));
+  if (mod && mod[1] && !/^\.|^\//.test(mod[1])) {
+    const plan = "npm install " + mod[1].split("/")[0].replace(/^@/, "");
+    addLog(cc(CRIMSON + BOLD, " auto-fix candidate: ") + cc(DIM, plan + " \u00b7 running it"));
+    await runBash(plan, 90000, null);
+    return;   // the next failing/succeeding output refreshes or clears the card
+  }
+  DIAG = DIAG.filter((x) => x !== c);
+  addLog(cc(DIM, " card dismissed \u00b7 no heuristic matched; the failing line stays in /diag for the model"));
+  scheduleDraw(true);
+}
+
+// ---- dependency radar ( fig 2 ): after a write/edit, scan who imports the file and show the fan-out on the rail
+async function radarScan(fp) {
+  try {
+    const p = path.resolve(CWD, String(fp || ""));
+    const B = path.basename(p);
+    if (!fs.existsSync(p) || !fs.statSync(p).isFile() || fs.statSync(p).size > 2000000) return;
+    const readables = new Set(["js", "mjs", "cjs", "ts", "tsx", "jsx", "vue", "svelte", "py", "ps1", "c", "cc", "cpp", "h", "hpp", "cs", "go", "rs", "java", "rb", "php", "sh", "json", "md", "yml", "yaml", "toml", "html", "css", "txt", "astro"]);
+    const skip = new Set(SKIP_DIRS.concat([".hydra", ".trash"]));
+    const hits = [];
+    const walk = (d, rel) => {
+      if (hits.length >= 40) return;
+      let names = [];
+      try { names = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of names) {
+        if (e.isDirectory()) { if (skip.has(e.name)) continue; walk(path.join(d, e.name), rel ? rel + "\\" + e.name : e.name); continue; }
+        if (e.name === B || e.name.startsWith(".") || e.name.endsWith(".tmp")) continue;
+        const ext = path.extname(e.name).slice(1).toLowerCase();
+        if (!readables.has(ext) || e.name.endsWith(B)) continue;
+        if (hits.length >= 24) return;
+        try {
+          const txt = fs.readFileSync(path.join(d, e.name), "utf8").slice(0, 500000);
+          txt.split("\n").forEach((l, i) => {
+            if (hits.length >= 24) return;
+            if (l.includes(B) && hits.length < 24) hits.push({ tgt: (rel ? rel + "\\" : "") + e.name, line: i + 1, txt: l.trim().slice(0, 90) });
+          });
+        } catch { /* unreadable: skip file */ }
+      }
+    };
+    walk(CWD, "");
+    hits.sort((a, b) => a.tgt.localeCompare(b.tgt));
+    UI.RADAR = { n: hits.length, top: hits.slice(0, 4), file: B, at: Date.now() };
+    addLog(cc(DIM, " radar fan-out: " + hits.length + " referencing " + clip(B, 24)));
+    if (hits.length) { for (const h of hits.slice(0, 3)) addLog(cc(DIM, "   \u21b3 " + clip(h.tgt + ":" + h.line, Math.max(40, UI.cols - PANEL_W - 16)) + " " + clip(h.txt, 44))); }
+    else addLog(cc(DIM, "   (nothing imports " + clip(B, 20) + ")"));
+  } catch (e) { addLog(cc(DIM, "   radar skipped: " + clip(String(e && e.message || e), 60))); }
+  scheduleDraw(true);
 }
 
 
@@ -1722,8 +2075,77 @@ function saveSession() {
     }
     ACTIVE_SESSION_FILE = file;
     SESSIONS_DIRTY = true;
+    try { saveCheckpoint(true); } catch { /* time travel snapshot is best effort */ }
     return file;
   } catch { return null; }
+}
+
+// ---- time travel: every finished turn snapshots into ~/.hydra/checkpoints ( capped at 24 ), /time rewinds ----
+const CHK_DIR = () => path.join(CFG_DIR, "checkpoints");
+let CHK_SIG = "";
+let CHK_LAST = null;
+function saveCheckpoint(auto) {
+  try {
+    if (HISTORY.length < 2) return null;
+    const last = HISTORY[HISTORY.length - 1] || {};
+    const sig = HISTORY.length + "|" + String(last.content || "").slice(0, 80);
+    if (auto && CHK_SIG === sig) return null;   // same content: skip ( tool-step saves don't spam the dir )
+    CHK_SIG = sig;
+    const name = (CURRENT_SESSION_TITLE || sessionNameText() || "chat").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "chat";
+    const file = String(Date.now()).padStart(13, "0") + "-" + name + ".json";
+    fs.mkdirSync(CHK_DIR(), { recursive: true });
+    atomicWrite(path.join(CHK_DIR(), file), JSON.stringify({ when: new Date().toISOString(), name: CURRENT_SESSION_TITLE || name, from: ACTIVE_SESSION_FILE, history: HISTORY }, null, 2));
+    restrictDir(CHK_DIR(), 24);
+    CHK_LAST = file;
+    addLog(cc(DIM, "  \u21bb checkpoint saved \u00b7 /time rewinds"));
+    return file;
+  } catch { return null; }
+}
+function restrictDir(dir, cap) {
+  try {
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
+    for (const f of files.slice(0, Math.max(0, files.length - cap))) { try { fs.unlinkSync(path.join(dir, f)); } catch { /* nop */ } }
+  } catch { /* nop */ }
+}
+function restoreCheckpoint(file) {
+  if (UI.busy) { addLog(cc(DIM, " can't rewind while a turn runs \u00b7 esc interrupts first")); return; }
+  try {
+    let raw = fs.readFileSync(path.join(CHK_DIR(), String(file)), "utf8");
+    if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
+    const j = JSON.parse(raw);
+    HISTORY = Array.isArray(j.history) ? j.history : [];
+    UI.TODOS = []; UI.scroll = 0; UI.log = [];
+    CTX.excl.clear(); REC.on = false; UI.TOKENS = Math.max(UI.TOKENS, 0);
+    CHK_SIG = "}";
+    UI.turn = Math.floor(HISTORY.length / 2);
+    CURRENT_SESSION_TITLE = j.name || "";
+    saveSession();
+    addLog(cc(CRIMSON + BOLD, "  \u23ee time travel: rewound to ") + clip(String(j.when || "").replace("T", " ").slice(0, 19), 26) + cc(DIM, " (" + HISTORY.length + " messages)"));
+    for (const m of HISTORY) {
+      let c = String(m.content || "");
+      if (!c.trim() || c.startsWith("[skill")) continue;
+      c = c.replace(/[ \t]+/g, " ").trim();
+      if (c.length > 2400) c = c.slice(0, 2400) + " \u2026";
+      addLog(m.role === "user" ? cc(CRIMSON + BOLD, " \u276f " + c) : "  " + c);
+    }
+  } catch (e) { addLog(cc("\u001b[31m", " rewind failed: " + (e.message || e))); }
+  scheduleDraw(true);
+}
+function openTimeDialog() {
+  const items = [];
+  try {
+    fs.mkdirSync(CHK_DIR(), { recursive: true });
+    for (const f of fs.readdirSync(CHK_DIR()).filter((f) => f.endsWith(".json")).sort().reverse()) {
+      try {
+        const j = JSON.parse(fs.readFileSync(path.join(CHK_DIR(), f), "utf8"));
+        items.push({ value: f, name: clip(String(j.name || f), 40), when: j.when || "", turns: Math.floor(((j.history || []).length) / 2), whenISO: j.when || "" });
+      } catch { items.push({ value: f, name: String(f) }); }
+    }
+  } catch { /* first time */ }
+  updateGhost();
+  if (!items.length) { addLog(cc(DIM, " no checkpoints yet \u00b7 every finished turn saves one automatically \u00b7 /time lists them")); return; }
+  UI.dialog = { kind: "sessions", sel: 0, items, mode: "", buf: "", preview: [], previewFile: "", title: "time travel \u2502 \u2193\u2193 enter rewinds \u00b7 esc close", isTime: true };
+  scheduleDraw(true);
 }
 
 async function genSessionTitle() {
@@ -1802,6 +2224,8 @@ function loadSessionFile(file) {
     }
     if (HISTORY.length > shown) addLog(cc(DIM, "  (" + (HISTORY.length - shown) + " system/skill messages not shown)"));
     if (wasActive) addLog(cc(DIM, " (that was already the active session \u2014 nothing else changed)"));
+    CTX.excl.clear(); CHK_SIG = ""; REC.on = false;   // new session: parked turns + macro recording + checkpoint debounce reset
+    updateGhost();
   } catch (e) {
     addLog(cc("\u001b[31m", " load failed: " + (e.message || e)));
   }
@@ -2000,7 +2424,8 @@ function drawFrame() {
   const inW = Math.max(0, barX - 8);
   const ip = stripAnsi(UI.input);
   const vis = ip.length > inW ? "\u2026" + ip.slice(-inW) : ip;
-  out.push(ESC + "[" + (rows - 4) + ";1H" + ESC + "[K" + BAR + " \u276f " + vis);
+  const gtry = UI.GHOST && ip === stripAnsi(UI.input) ? Math.max(0, inW - ip.length) : 0;
+  out.push(ESC + "[" + (rows - 4) + ";1H" + ESC + "[K" + BAR + " \u276f " + vis + (gtry > 1 ? cc(DIM, UI.GHOST.slice(0, gtry).trimEnd()) : ""));
   SCR[rows - 4] = BAR + " \u276f " + vis;
   const modelShort = clip(p0.model, Math.max(14, LW - 34));
   const line2 = BAR + " " + cc(CRIMSON + BOLD, UI.mode) + cc(DIM, " \u00b7 ") + cc(CRIMSON, modelShort) + (p0.apiKey ? "" : cc(DIM, "  (local)"));
@@ -2011,19 +2436,22 @@ function drawFrame() {
   SCR[rows - 4] = (SCR[rows - 4] + "").padEnd(barX - 2, " ") + "\u2502\u2562";
   const busy = UI.busy;
   const conf = UI_CONFIRM;
-  const footL = conf
+  const footL = (UI.REC.on ? cc("\u001b[31m", " \u25cf rec ") : "")
+    + (conf
     ? ledOnStyles() + cc(CRIMSON + BOLD, " \u26a0 sandbox \u00b7 allow: ") + cc(DIM, clip(conf.label, Math.max(30, UI.cols - PANEL_W - 44))) + cc(CRIMSON + BOLD, "  y allow") + cc(DIM, " \u00b7 n/esc " + Math.max(0, Math.ceil(((conf.dead || Date.now() + 120000) - Date.now()) / 1000)) + "s left")
     : busy
-    ? ledOnStyles() + cc(CRIMSON + BOLD, " " + SPINNER_FRAMES[UI.spinner] + " " + UI.busyLabel) + cc(DIM, " " + fmtDur(Date.now() - UI.busyStart) + (Date.now() - UI.busyStart > 12000 ? " \u00b7 still working" : "") + " \u00b7 esc interrupt")
-    : " " + ledOff + cc(DIM, CWD);
+    ? ledOnStyles() + cc(CRIMSON + BOLD, " " + SPINNER_FRAMES[UI.spinner] + " " + UI.busyLabel) + cc(DIM, " " + fmtDur(Date.now() - UI.busyStart)
+      + (UI.TPS && UI.TPS.t > Date.now() - 3000 && UI.TPS.c > 40 && UI.TPS.t0 && Date.now() - UI.TPS.t0 > 1200 ? " \u00b7 " + Math.round(UI.TPS.c / Math.max(0.4, (UI.TPS.t - UI.TPS.t0) / 1000)) + " c/s" : "")
+      + (Date.now() - UI.busyStart > 12000 ? " \u00b7 still working" : "") + " \u00b7 esc interrupt")
+    : " " + ledOff + cc(DIM, CWD));
   let footR = busy ? (PENDING
     ? cc(CRIMSON + BOLD, " \u23f3 switching to \u201c" + clip(PENDING_NAME || "", 26) + "\u201d after this reply ")
-    : (UI.QUEUE.length ? cc(DIM, " \u23f3 " + UI.QUEUE.length + " queued \u00b7 ") : "") + cc(DIM, "esc interrupt \u00b7 ctx " + ctxK() + " "))
+    : (UI.QUEUE.length ? cc(DIM, " \u23f3 " + UI.QUEUE.length + " queued \u00b7 ") : "") + cc(DIM, "esc interrupt \u00b7 tok " + UI.TOKENS + " \u00b7 ctx " + ctxK() + " "))
     : (UI.scroll > 0
     ? cc(CRIMSON + BOLD, " \u2191 " + UI.scroll + " (pgup/pgdn ") + cc(DIM, "\u00b7 type to return ")
     : (ctxTokens() > 90000
     ? cc(CRIMSON + BOLD, " ctx " + ctxK() + " filling \u00b7 /clear? ") + cc(DIM, "\u00b7 turn " + UI.turn + " ")
-    : cc(DIM, " / commands \u00b7 enter send \u00b7 turn " + UI.turn + " \u00b7 ctx " + ctxK() + " ")));
+    : cc(DIM, " / commands \u00b7 enter send \u00b7 turn " + UI.turn + " \u00b7 tok " + UI.TOKENS + " \u00b7 ctx " + ctxK() + " ")));
   out.push(ESC + "[" + (rows - 2) + ";1H" + padRow(footL, barX - stripAnsi(footR).length - 1) + footR + cc(DIM, "\u2562") + padRow("", PANEL_W));
   SCR[rows - 2] = plainRow(footL, barX - stripAnsi(footR).length - 1) + stripAnsi(footR) + "\u2562";
   // -------- toast card ( notification that floats over the last body row, spinner-ticking until it fades )
@@ -2069,6 +2497,12 @@ function popupKind() {
   return t.startsWith("custom models") ? "custom" : t.split(" ")[0];
 }
 function closePopup() { UI.popupOpen = false; UI.popupTitle = ""; UI.popupItems = []; UI.popupSel = 0; scheduleDraw(); }
+function openCtxPicker() {
+  const xs = boardExchanges();
+  if (!xs.length) { addLog(cc(DIM, " nothing to park yet \u00b7 say something first")); return; }
+  openPopup("ctx \u2502 enter parks / unparks \u00b7 esc close",
+    xs.slice().reverse().map((x) => ({ label: clip((x.parked ? "PARKED\u00a0\u00a0\u00a0 " : "on\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0\u00a0 ") + "turn " + x.turn, 34), desc: " " + x.head + (x.parked ? " (enter restores)" : ""), value: x.i })));
+}
 
 function syncSlashPopup() {
   const q = UI.input;
@@ -2302,6 +2736,7 @@ async function submitLine() {
     if (UI.busy) { addLog(cc(DIM, " wait for the reply to finish, or press esc to interrupt first")); return; }
     HISTORY = []; UI.log = []; UI.turn = 0; UI.scroll = 0; SELECTION = null;
     CURRENT_SESSION_TITLE = ""; ACTIVE_SESSION_FILE = ""; SESSION_FILE_TS = null;
+    CTX.excl.clear(); UI.TOKENS = 0; REC.on = false; DIAG = [];
     addLog(cc(DIM, " context cleared \u00b7 fresh session file next turn"));
     return;
   }
@@ -2335,6 +2770,7 @@ async function submitLine() {
     saveSession();
     HISTORY = []; UI.turn = 0; UI.scroll = 0;
     CURRENT_SESSION_TITLE = ""; ACTIVE_SESSION_FILE = ""; SESSION_FILE_TS = null;
+    CTX.excl.clear(); UI.TOKENS = 0; REC.on = false;
     addLog(cc(CRIMSON + BOLD, "  + new session \u00b7 context cleared, files untouched"));
     return;
   }
@@ -2469,6 +2905,38 @@ async function submitLine() {
     } catch (e) { addLog(cc("\u001b[31m", " fork failed: " + (e.message || e))); }
     return;
   }
+  if (q === "/zone" || q === "/rules") {
+    addLogLines(zoneLines());
+    return;
+  }
+  if (q === "/ctx" || q.startsWith("/ctx ")) {
+    openCtxPicker();
+    return;
+  }
+  if (q.startsWith("/purge")) {
+    purgeStale(q.replace("/purge", "").trim());
+    return;
+  }
+  if (q === "/time" || q.startsWith("/time ")) {
+    openTimeDialog();
+    return;
+  }
+  if (q === "/rec") { if (REC.on) recStop(); else recStart(); return; }
+  if (q.startsWith("/rec ")) {
+    const a = q.replace("/rec", "").trim();
+    if (a === "start") recStart();
+    else recStop(a);
+    return;
+  }
+  if (q.startsWith("/macro ")) { await macroRun(q.replace("/macro", "").trim()); return; }
+  if (q === "/macro") { addLog(cc(DIM, " /macro <name> \u00b7 replays a recorded macro skill \u00b7 ctrl+r records steps, /rec compiles them")); return; }
+  if (q === "/diag") { addLogLines(diagLines()); return; }
+  if (q === "/fix") { await diagFix(); return; }
+  if (q === "/lane" || q.startsWith("/lane ")) {
+    if (UI.LANES.abort) { laneStop(); return; }
+    await laneStart(q.replace("/lane", "").trim());
+    return;
+  }
   if (q.startsWith("/theme")) {
     const argm = q.replace("/theme", "").trim().toLowerCase();
     if (!argm) {
@@ -2560,6 +3028,7 @@ async function runAgentTurn(q, extraSystem) {
   try {
     await agentLoop(q, provider, (t) => {
       streamed += t;
+      UI.TPS = { c: stripAnsi(streamed).length, t: Date.now(), t0: UI.busyStart };   // telemetry: streaming chars/s ( footer )
       // single path: the entry keeps the RAW markdown and the drawer renders it every frame —
       // tables align live while rows stream in, instead of a wrapped garble being finalized after
       if (curLog) { curLog.cache = null; curLog.text = streamed; }
@@ -2830,7 +3299,9 @@ function onKey(str, key) {
       toast("ctrl+c again to exit");
       return;
     }
-    if (key.ctrl && key.name === "p") { UI.mode = UI.mode === "Build" ? "Plan" : "Build"; addLog(cc(DIM, " mode -> " + UI.mode)); return; }
+    if (key.ctrl && key.name === "p") { openGovernPicker(); return; }   // fig 5: the context-govern picker replaces the tab-duplicated build/plan toggle
+    if (key.ctrl && key.name === "g") { openCtxPicker(); return; }      // fast park picker ( same as /ctx )
+    if (key.ctrl && key.name === "r") { if (REC.on) recStop(); else recStart(); return; }   // macro record/compile
     // ---- custom provider text capture ( name -> baseURL -> hidden api key ) wins over all modal keys
     if (CUSTOM_CAPTURE) {
       const cap = CUSTOM_CAPTURE;
@@ -2892,6 +3363,7 @@ function onKey(str, key) {
         const it = d.items[Number(str) - 1];
         closeDialog();
         if (it && it.value) {
+          if (d.isTime) { restoreCheckpoint(it.value); return; }
           if (String(it.value) === ACTIVE_SESSION_FILE) { addLog(cc(DIM, " (that is already the active session \u00b7 your chat is right here)")); scheduleDraw(true); }
           else loadSessionFile(it.value);
         }
@@ -2903,6 +3375,7 @@ function onKey(str, key) {
     if (UI.busy) {
       if (key.name === "escape") {
         if (SELECTION) { SELECTION = null; fullDraw = true; scheduleDraw(true); return; }   // esc first legally clears a drag selection
+        if (UI.LANES.abort) { laneStop(); if (!UI.popupOpen) return; }
         if (UI.popupOpen) { closePopup(); if (UI.input.startsWith("/")) setUserInput(""); }
         else if (ABORT) { try { ABORT.abort(); } catch { /* nop */ } }
         return;
@@ -2912,7 +3385,7 @@ function onKey(str, key) {
         const pk = popupKind();
         // read-only commands are allowed while a turn runs (sessions browsing must never be blocked)
         if (UI.popupOpen && pk !== "slash" && pk !== "custom" && pk !== "model" && pk !== "provider") { popupActivate(); return; }
-        if ((UI.popupOpen && !cmd) || /^(\/(sessions|resume|help|mcp|mcps?|copylast|cd|export|rename|provider|model|fork|search|theme|key|undo|regen|web|stats)\b)/.test(cmd)) {
+        if ((UI.popupOpen && !cmd) || /^(\/(sessions|resume|help|mcp|mcps?|copylast|cd|export|rename|provider|model|fork|search|theme|key|undo|regen|web|stats|ctx|time|zone|rules|diag|lane)\b)/.test(cmd)) {
           submitLine().catch((e) => { addLog(cc("\u001b[31m", " " + (e.message || e))); scheduleDraw(); });
           return;
         }
@@ -2950,6 +3423,7 @@ function onKey(str, key) {
     if ((key.ctrl && key.name === "v") || (key.shift && key.name === "insert")) { pasteClipboard(); return; }
     if (key.name === "escape") {
       if (SELECTION) { SELECTION = null; fullDraw = true; scheduleDraw(true); return; }
+      if (UI.LANES.abort) { laneStop(); return; }   // idle esc also ends a running lane
       if (UI.popupOpen) { closePopup(); if (UI.input.startsWith("/")) setUserInput(""); }
       return;
     }
@@ -2972,6 +3446,13 @@ function onKey(str, key) {
       return;
     }
     if (key.name === "tab") {
+      if (UI.GHOST && !UI.popupOpen) {   // ghost-write: tab accepts the suggested completion
+        const got = UI.GHOST;
+        setUserInput(UI.input + got);
+        UI.GHOST = "";
+        addLog(cc(DIM, " \u21e5 ghost accepted \u00b7 +" + got.trim().length + " chars"));
+        return;
+      }
       if (UI.popupOpen && UI.popupItems.length) {
         const it = UI.popupItems[UI.popupSel];
         if (it && UI.popupTitle === "slash") setUserInput((it.value || stripAnsi(it.label)).trim() + " ");
@@ -3821,6 +4302,155 @@ async function main() {
     setTimeout(() => { "/exit".split("").forEach((c) => send(c)); }, 11500);
     setTimeout(() => send("", { name: "return" }), 11700);
     setTimeout(() => process.exit(0), 12500);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "21") {
+    tuiSession();
+    setTimeout(() => {
+      try {
+        HISTORY.push({ role: "user", content: "ctx probe turn one: pickup-z21" }, { role: "assistant", content: "pong one z21" });
+        HISTORY.push({ role: "user", content: "ctx probe turn two: small" }, { role: "assistant", content: "pong two" });
+        HISTORY.push({ role: "user", content: "ctx probe turn three: stale \u00b7 " + "z21x".repeat(300) }, { role: "assistant", content: "pong three z21x".repeat(160) });
+        HISTORY.push({ role: "user", content: "ctx probe turn four: stale \u00b7 " + "z21y".repeat(300) }, { role: "assistant", content: "pong four z21y".repeat(160) });
+        HISTORY.push({ role: "user", content: "ctx probe turn five: stale \u00b7 " + "z21z".repeat(300) }, { role: "assistant", content: "pong five z21z".repeat(160) });
+        HISTORY.push({ role: "user", content: "ctx probe turn six: fresh \u00b7 boundary" }, { role: "assistant", content: "pong six fresh" });
+        const b1 = budgetFace();
+        addLog(cc(DIM, " gnv1:budget " + b1.tok + " tokens cap " + b1.cap + " trim " + b1.dropped.trim + " park " + b1.dropped.park));
+        CTX.excl.add(0); CTX.excl.add(1);
+        const b2 = budgetFace();
+        addLog(cc(DIM, " gnv2:parked " + b2.dropped.park + " turn \u00b7 window tokens " + b2.tok));
+        CTX.excl.clear();
+        purgeStale("200");
+        const b3 = budgetFace();
+        addLog(cc(DIM, " gnv3:after-purge window tokens " + b3.tok + " \u00b7 gnv-done"));
+      } catch (e) { crashLog(e); addLog(cc("\u001b[31m", " s21 error: " + (e && e.message))); }
+      setTimeout(() => process.exit(0), 1600);
+    }, 1200);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "22") {
+    tuiSession();
+    setTimeout(() => {
+      try {
+        HISTORY.push({ role: "user", content: "chk travel one marker-chk-A" }, { role: "assistant", content: "ack-A" });
+        saveSession();
+        HISTORY.push({ role: "user", content: "chk travel two marker-chk-B" }, { role: "assistant", content: "ack-B" });
+        saveSession();
+        const files = fs.readdirSync(CHK_DIR()).filter((f) => f.endsWith(".json")).sort();
+        restoreCheckpoint(files[0]);
+        addLog(cc(DIM, " chk:after-rewind messages " + HISTORY.length + " last " + clip(String((HISTORY[HISTORY.length - 1] || {}).content || ""), 26)));
+        addLog(cc(DIM, " chk:list " + fs.readdirSync(CHK_DIR()).filter((f) => f.endsWith(".json")).length + " checkpoints (after rewind)"));
+      } catch (e) { crashLog(e); addLog(cc("\u001b[31m", " s22 error: " + (e && e.message))); }
+      setTimeout(() => process.exit(0), 1600);
+    }, 1200);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "23") {
+    tuiSession();
+    setTimeout(() => {
+      try {
+        fs.writeFileSync(path.join(CWD, ".agentrules"), "deny rm -rf\nallow write-output\n", "utf8");
+        (async () => {
+          try {
+            CFG.sandbox = "open";
+            const r1 = await runToolCall({ function: { name: "bash", arguments: JSON.stringify({ command: "Write-Output zone-allow-OK" }) } }, null);
+            addLog(cc(DIM, " zone1:allow-out " + clip(String(r1.result), 26)));
+            const r2 = await runToolCall({ function: { name: "bash", arguments: JSON.stringify({ command: "rm -rf zone-out-z23" }) } }, null);
+            addLog(cc(DIM, " zone2:deny-out " + (String(r2.result).includes("BLOCKED by zone rules") ? "BLOCKED-z23" : "LEAK-z23")));
+          } catch (e) { crashLog(e); addLog(cc("\u001b[31m", " s23 error: " + (e && e.message))); }
+          setTimeout(() => process.exit(0), 1400);
+        })();
+      } catch (e) { crashLog(e); }
+    }, 900);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "24") {
+    tuiSession();
+    setTimeout(() => {
+      (async () => {
+        try {
+          recStart();
+          const r1 = await runBash("Write-Output MACROSTEP-A", 8000, null);
+          addLog(cc(DIM, " stepA-out " + clip(String((r1 && (r1.out !== undefined ? r1.out : r1.stdout)) || "").trim(), 30)));
+          const r2 = await runBash("Write-Output MACROSTEP-B", 8000, null);
+          addLog(cc(DIM, " stepB-out " + clip(String((r2 && (r2.out !== undefined ? r2.out : r2.stdout)) || "").trim(), 30)));
+          await recStop("capture-flow");
+          addLog(cc(DIM, " macro:done slug " + (REC.last || "none")));
+        } catch (e) { crashLog(e); addLog(cc("\u001b[31m", " s24 error: " + (e && e.message))); }
+        setTimeout(() => process.exit(0), 1800);
+      })();
+    }, 900);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "25") {
+    tuiSession();
+    setTimeout(() => {
+      (async () => {
+        try {
+          const tgt = ["radar", "-z25", "t"].join("") + "arget.js";
+          fs.writeFileSync(path.join(CWD, tgt), "export function sourceFan() {\n  return RADARSRC;\n}\n", "utf8");
+          fs.writeFileSync(path.join(CWD, "z25-usr.js"), "import { sourceFan } from './" + tgt + "';\nexport const PINGFAN = sourceFan();\n", "utf8");
+          await radarScan(tgt);
+          addLog(cc(DIM, " radar:done count " + (UI.RADAR ? UI.RADAR.n : "-")));
+        } catch (e) { crashLog(e); addLog(cc("\u001b[31m", " s25 error: " + (e && e.message))); }
+        setTimeout(() => process.exit(0), 1700);
+      })();
+    }, 900);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "26") {
+    tuiSession();
+    setTimeout(() => {
+      (async () => {
+        try {
+          const r1 = await runToolCall({ function: { name: "bash", arguments: JSON.stringify({ command: "Get-Content diag-missing-z26.txt" }) } }, null);
+          addLog(cc(DIM, " dg1:code-exit " + (String(r1.result).includes("]exit") || String(r1.result).includes("[exit") ? "exit-z26" : "GLOSS-z26")));
+          PROMPT_HIST.push("echo batman-vocab-two");
+          PROMPT_HIST.push("echo batman-vocab-one; echo more-bat");
+          setUserInput("echo batman-vocab");
+          addLog(cc(DIM, " ghost:shown " + (UI.GHOST ? "yes-s26" : "no-s26") + " tail " + clip(UI.GHOST, 20)));
+        } catch (e) { crashLog(e); addLog(cc("\u001b[31m", " s26 error: " + (e && e.message))); }
+        setTimeout(() => {
+          const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+          send("", { name: "tab" });
+          setTimeout(() => process.exit(0), 900);
+        }, 900);
+      })();
+    }, 900);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "27") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    setTimeout(() => {
+      (async () => {
+        try {
+          const httpm = await import("node:http");
+          const srv = httpm.createServer((req, res) => {
+            const body = [];
+            req.on("data", (c) => body.push(c));
+            req.on("end", () => {
+              if (req.method === "POST" && String(req.url).includes("chat/completions")) {
+                res.writeHead(200, { "Content-Type": "text/event-stream" });
+                res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "lane-chunk-b0 lane-chunk-b1 lane-chunk-b2" } }] }) + "\n\n");
+                res.write("data: [DONE]\n\n");
+                res.end();
+              } else res.end(JSON.stringify({ data: [{ id: "alpha-a" }] }));
+            });
+          });
+          await new Promise((ok) => srv.listen(7096, "127.0.0.1", ok));
+          srv.unref?.();
+          loadCfg();
+          CFG.providers["prov-lane"] = { name: "prov-lane", baseURL: "http://127.0.0.1:7096/v1", apiKey: "k-z27", model: "alpha-a" };
+          CFG.active = "prov-lane";
+          saveCfg();
+          await laneStart("grid: summarize the constellation in one line");
+          addLog(cc(DIM, " tele:tok " + UI.TOKENS + " \u00b7 z27-done"));
+        } catch (e) { crashLog(e); addLog(cc("\u001b[31m", " s27 error: " + (e && e.message))); }
+        setTimeout(() => process.exit(0), 1600);
+      })();
+    }, 500);
+    void send;
     return;
   }
   if (process.env.HYDRA_TEST) {
