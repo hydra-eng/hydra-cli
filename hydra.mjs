@@ -657,6 +657,7 @@ async function agentLoop(question, provider, ondelta, onTool, history, signal, n
   ];
   let finalText = "";
   let exhausted = true;
+  const receipts = [];   // what this turn's tools actually did — folded into the saved reply so a fresh turn ( or resume ) keeps the receipts
   for (let step = 0; step < MAX_STEPS; step++) {
     // transient network hiccups ( LAN blips, ECONNRESET mid-stream, keep-alive/pend drops ) retry
     // per round instead of ending the turn as "turn error" — the old behaviour stopped the work
@@ -677,24 +678,36 @@ async function agentLoop(question, provider, ondelta, onTool, history, signal, n
     if (out.content) UI.TOKENS += Math.max(1, Math.round(String(out.content).length / 4));   // approx reply tokens this session ( footer "tok" )
     messages.push({ role: "assistant", content: out.content, ...(out.tool_calls ? { tool_calls: out.tool_calls } : {}) });
     if (!out.tool_calls || signal?.aborted) {
-      if (history) {
-        history.push({ role: "user", content: question }, { role: "assistant", content: finalText });
+      // the empty-reply glitch: an oversight return with no text used to save a [user, ""] pair that
+      // polluted the transcript and confused resumes — the question is kept in /regen instead
+      if (history && String(finalText).trim()) {
+        const fin = receipts.length ? finalText + "\n\n[work log]\n" + receipts.slice(-10).map((s) => "- " + s).join("\n") + "\n(folded so the next turn keeps the receipts; older logs live in /time)" : finalText;
+        history.push({ role: "user", content: question }, { role: "assistant", content: fin });
       }
+      if (receipts.length) addLog(cc(DIM, " \u234b work log folded into the reply \u00b7 " + receipts.length + " step" + (receipts.length === 1 ? "" : "s") + " recorded"));
       return finalText;
     }
     for (const tc of out.tool_calls) {
       TOOL_CALLS_TOTAL++;
       if (onTool) onTool(runToolLabel(tc));
       const callRes = await runToolCall(tc, signal);
-      messages.push({ role: "tool", tool_call_id: tc.id, content: callRes.result });
+      const rv = String(callRes.result || "");
+      const rvTag = rv.length > 8000 ? rv.slice(0, 8000) + "\n\u2026(window-clipped \u00b7 rerun for more)" : rv;
+      messages.push({ role: "tool", tool_call_id: tc.id, content: rvTag });
+      receipts.push(clip(runToolLabel(tc), 46) + " -> " + clip(rv.replace(/\s+/g, " ").trim() || "done", 60));
       try { saveSession(); } catch { /* durability between tool steps */ }
       if (signal?.aborted) return finalText;
     }
   }
-  // the step budget ran out while the model still wanted to work: say so instead of vanishing and
-  // keep the partial exchange in the history so a follow-up turn starts from where this one stopped
-  if (!signal?.aborted && history) {
-    history.push({ role: "user", content: question }, { role: "assistant", content: finalText });
+  // the step budget ran out while the model still wanted to work: say so LOUDLY even when the
+  // last round streamed only tool calls (no reply text to save) — silence here is how turns "stopped
+  // in between" without a trace; the receipts still fold into whatever text came out
+  if (!signal?.aborted) {
+    if (history && String(finalText).trim()) {
+      const fin = receipts.length ? finalText + "\n\n[work log]\n" + receipts.slice(-10).map((s) => "- " + s).join("\n") + "\n(stopped mid-work \u00b7 folded so the next turn keeps the receipts)" : finalText;
+      history.push({ role: "user", content: question }, { role: "assistant", content: fin });
+    }
+    if (receipts.length) addLog(cc(DIM, " \u234b work log folded into the reply \u00b7 " + receipts.length + " step" + (receipts.length === 1 ? "" : "s") + " recorded"));
     addLog(cc("\u001b[33m", " \u23f3 step budget reached after " + MAX_STEPS + " tool rounds \u00b7 the turn stopped mid-work \u00b7 say \"continue\" to keep going \u00b7 HYDRA_MAX_STEPS tunes this"));
     scheduleDraw(true);
   }
@@ -1051,8 +1064,24 @@ function crashLog(err) {
 // atomic-ish session save: write to a temp sibling then rename, so a crash can never leave a half-written session
 function atomicWrite(file, data) {
   const tmp = file + ".tmp" + String(process.pid);
-  fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, file);
+  let lastErr = null;
+  for (let i = 0; i < 3; i++) {
+    try {
+      fs.writeFileSync(tmp, data);
+      fs.renameSync(tmp, file);
+      return;
+    } catch (e) {
+      lastErr = e;
+      if (!/(EPERM|EACCES|EBUSY|EISDIR|ENOENT)/i.test(String(e.code || e.message || ""))) throw e;
+      try { fs.unlinkSync(tmp); } catch { /* nop */ }
+      const spin = Date.now() + 40 + 120 * i;
+      while (Date.now() < spin) { }   // defender file locks clear in tens of ms; backoff beats a hard throw
+    }
+  }
+  try {   // last resort: direct write ( never atomic, better than losing the session )
+    fs.writeFileSync(file, data);
+    try { fs.unlinkSync(tmp); } catch { /* nop */ }
+  } catch (e2) { throw lastErr || e2; }
 }
 
 // production watchdog: every 1s record loop lag + state into ~/.hydra/heartbeat.txt,
@@ -1542,7 +1571,7 @@ function budgetFace(history) {
   let face = live.length > MODEL_KEEP ? live.slice(-MODEL_KEEP) : live;
   const dropped = { trim: live.length - face.length, park: history ? 0 : Math.floor(CTX.excl.size / 2) };
   let tok = faceTokens(face);
-  const cap = Math.max(2000, (Number(process.env.HYDRA_CTX_MAX) || 0) || ((CTX.maxK || 0) * 1000) || 60000);
+  const cap = Math.max(2000, (Number(process.env.HYDRA_CTX_MAX) || 0) || ((CTX.maxK || 0) * 1000) || 24000);
   while (face.length > 2 && tok > cap) {
     const gone = face.shift();
     tok = Math.max(0, Math.round(tok - String((gone && gone.content) || "").length / 4));
@@ -2069,6 +2098,7 @@ function sessionFileTS() {
   if (!SESSION_FILE_TS) SESSION_FILE_TS = new Date().toISOString().replace(/[:.]/g, "-");
   return SESSION_FILE_TS;
 }
+let SAVE_FAIL_AT = 0;
 function saveSession() {
   try {
     if (!HISTORY.length) return null;
@@ -2093,7 +2123,14 @@ function saveSession() {
     SESSIONS_DIRTY = true;
     try { saveCheckpoint(true); } catch { /* time travel snapshot is best effort */ }
     return file;
-  } catch { return null; }
+  } catch (e) {
+    const n = Date.now();
+    if (!SAVE_FAIL_AT || n - SAVE_FAIL_AT > 30000) {
+      SAVE_FAIL_AT = n;
+      addLog(cc("\u001b[31m", " !! session save failed: " + clip(String((e && (e.code || e.message)) || e), 70)));
+    }
+    return null;
+  }
 }
 
 // ---- time travel: every finished turn snapshots into ~/.hydra/checkpoints ( capped at 24 ), /time rewinds ----
