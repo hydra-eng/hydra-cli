@@ -533,7 +533,15 @@ async function chatOnce(messages, provider, ondelta, signal, noTools) {
   }
 }
 
-const MAX_STEPS = 32;
+// agent-loop step budget: how many model/tool rounds one turn may run before it pauses for the
+// user instead of silently dying mid-work ( the old fixed 32 fell off a long mission without a word ).
+// env HYDRA_MAX_STEPS tunes it.
+const MAX_STEPS = Math.max(1, Number(process.env.HYDRA_MAX_STEPS) || 100);
+// how many of the OLDEST kept-history messages the provider actually sees: the session file and the
+// in-memory history keep the TOTAL ( previously the saved history itself was hard-capped at 40
+// messages and older work was silently deleted on every turn ), only the model window is trimmed.
+// env HYDRA_KEEP_MSGS tunes it.
+const MODEL_KEEP = Math.max(2, Number(process.env.HYDRA_KEEP_MSGS) || 120);
 const SESSION_START = Date.now();
 let TOOL_CALLS_TOTAL = 0;
 
@@ -609,8 +617,11 @@ function inlineAttach(q) {
 
 async function agentLoop(question, provider, ondelta, onTool, history, signal, noTools, extraSystem) {
   const sys = SYS() + (noTools ? "\nPLAN MODE: Discuss and advise only. Do NOT call any tools this turn." : "") + (extraSystem ? "\n\n" + extraSystem : "");
-  const messages = [{ role: "system", content: sys }, ...(history || []), { role: "user", content: question }];
+  const hist = history || [];
+  const face = hist.length > MODEL_KEEP ? hist.slice(-MODEL_KEEP) : hist;   // provider sees the tail; the full total stays in history + the session file
+  const messages = [{ role: "system", content: sys }, ...face, { role: "user", content: question }];
   let finalText = "";
+  let exhausted = true;
   for (let step = 0; step < MAX_STEPS; step++) {
     const out = await chatOnce(messages, provider, ondelta, signal, noTools);
     finalText = out.content;
@@ -618,7 +629,6 @@ async function agentLoop(question, provider, ondelta, onTool, history, signal, n
     if (!out.tool_calls || signal?.aborted) {
       if (history) {
         history.push({ role: "user", content: question }, { role: "assistant", content: finalText });
-        while (history.length > 40) history.shift();
       }
       return finalText;
     }
@@ -630,6 +640,13 @@ async function agentLoop(question, provider, ondelta, onTool, history, signal, n
       try { saveSession(); } catch { /* durability between tool steps */ }
       if (signal?.aborted) return finalText;
     }
+  }
+  // the step budget ran out while the model still wanted to work: say so instead of vanishing and
+  // keep the partial exchange in the history so a follow-up turn starts from where this one stopped
+  if (!signal?.aborted && history) {
+    history.push({ role: "user", content: question }, { role: "assistant", content: finalText });
+    addLog(cc("\u001b[33m", " \u23f3 step budget reached after " + MAX_STEPS + " tool rounds \u00b7 the turn stopped mid-work \u00b7 say \"continue\" to keep going \u00b7 HYDRA_MAX_STEPS tunes this"));
+    scheduleDraw(true);
   }
   return finalText;
 }
@@ -995,7 +1012,9 @@ function enterTUI() {
     readline.emitKeypressEvents(process.stdin);
     process.stdin.on("data", () => { });
     try { process.stdin.resume(); } catch { /* nop */ }
-    process.stdout.write(ESC + "[?1049h" + ESC + "[?25l" + ESC + "[?1000h" + ESC + "[?1006h" + ESC + "[?2004h");
+    // ?1002 ( button-motion tracking ) is what makes real drag-select work in a live terminal:
+    // without it a terminal reports only clicks, so painting a drag selection was impossible
+    process.stdout.write(ESC + "[?1049h" + ESC + "[?25l" + ESC + "[?1000h" + ESC + "[?1002h" + ESC + "[?1006h" + ESC + "[?2004h");
     process.stdout.on("resize", () => {
       if (process.stdout.rows) UI.rows = process.stdout.rows;
       if (process.stdout.columns) UI.cols = process.stdout.columns;
@@ -1007,7 +1026,7 @@ function enterTUI() {
 }
 function exitTUI() {
   if (process.stdout.isTTY) {
-    process.stdout.write(ESC + "[?25h" + ESC + "[?1000l" + ESC + "[?1006l" + ESC + "[?2004l" + ESC + "[?1049l");
+    process.stdout.write(ESC + "[?25h" + ESC + "[?1000l" + ESC + "[?1002l" + ESC + "[?1006l" + ESC + "[?2004l" + ESC + "[?1049l");
     try { process.stdin.setRawMode(false); } catch { /* nop */ }
   }
 }
@@ -3699,6 +3718,79 @@ async function main() {
     setTimeout(() => { "qattdowrite the file".split("").forEach((c) => send(c)); }, 13500);
     setTimeout(() => send("", { name: "return" }), 13900);     // write + edit -> diff log + EDITDONE s18
     setTimeout(() => process.exit(0), 21000);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "19") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // full-history durability: 22 turns -> 44 messages must ALL land in the session file
+    // (the old hard 40-message cap silently deleted the four oldest) and the model-facing
+    // window must stay bounded without touching the file ( FACE:<n> reports what the provider got )
+    const httpm = await import("node:http");
+    const srv = httpm.createServer((req, res) => {
+      const body = [];
+      req.on("data", (c) => body.push(c));
+      req.on("end", () => {
+        const raw = Buffer.concat(body).toString();
+        if (req.method === "POST" && String(req.url).includes("chat/completions")) {
+          const mU = [...raw.matchAll(/\{"role":"(user|assistant|tool)"[^\}]*"content":"((?:[^"\\]|\\.)*)"/g)];
+          const nFace = Math.max(0, mU.length - 1);   // minus the live question
+          const lastU = mU.length ? mU[mU.length - 1][2] : "";
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "REPL:" + lastU + " FACE:" + nFace } }] }) + "\n\n");
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } else res.end(JSON.stringify({ data: [{ id: "alpha-a" }] }));
+      });
+    });
+    await new Promise((ok) => srv.listen(7093, "127.0.0.1", ok));
+    srv.unref?.();
+    loadCfg();
+    CFG.providers["prov-live"] = { name: "prov-live", baseURL: "http://127.0.0.1:7093/v1", apiKey: "key-s19", model: "alpha-a" };
+    CFG.active = "prov-live";
+    saveCfg();
+    for (let i = 1; i <= 22; i++) {
+      setTimeout(() => { ("t" + i).split("").forEach((c) => send(c)); }, 1400 + (i - 1) * 430);
+      setTimeout(() => send("", { name: "return" }), 1400 + (i - 1) * 430 + 140);
+    }
+    setTimeout(() => { "/exit".split("").forEach((c) => send(c)); }, 12300);
+    setTimeout(() => send("", { name: "return" }), 12500);
+    setTimeout(() => process.exit(0), 13500);
+    return;
+  }
+  if (process.env.HYDRA_TEST === "20") {
+    tuiSession();
+    const send = (s, k) => process.stdin.emit("keypress", s, k || { name: s });
+    // step budget: a model that always wants another tool round must stop LOUDLY after
+    // MAX_STEPS rounds (drive sets HYDRA_MAX_STEPS=3) instead of silently falling off the cliff
+    const httpm = await import("node:http");
+    let round = 0;
+    const srv = httpm.createServer((req, res) => {
+      const body = [];
+      req.on("data", (c) => body.push(c));
+      req.on("end", () => {
+        const raw = Buffer.concat(body).toString();
+        if (req.method === "POST" && String(req.url).includes("chat/completions")) {
+          round++;
+          res.writeHead(200, { "Content-Type": "text/event-stream" });
+          res.write("data: " + JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "cs" + round, type: "function",
+            function: { name: "bash", arguments: JSON.stringify({ command: "ping -n 2 127.0.0.1" }) } }] } }] }) + "\n\n");
+          res.write("data: [DONE]\n\n");
+          res.end();
+        } else res.end(JSON.stringify({ data: [{ id: "alpha-a" }] }));
+      });
+    });
+    await new Promise((ok) => srv.listen(7095, "127.0.0.1", ok));
+    srv.unref?.();
+    loadCfg();
+    CFG.providers["prov-live"] = { name: "prov-live", baseURL: "http://127.0.0.1:7095/v1", apiKey: "key-s20", model: "alpha-a" };
+    CFG.active = "prov-live";
+    saveCfg();
+    setTimeout(() => { "do the steps".split("").forEach((c) => send(c)); }, 1400);
+    setTimeout(() => send("", { name: "return" }), 1800);
+    setTimeout(() => { "/exit".split("").forEach((c) => send(c)); }, 11500);
+    setTimeout(() => send("", { name: "return" }), 11700);
+    setTimeout(() => process.exit(0), 12500);
     return;
   }
   if (process.env.HYDRA_TEST) {
