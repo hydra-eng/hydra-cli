@@ -51,6 +51,20 @@ Inspired by the Hermes Agent's design: hydra is not just a chat shell — it lea
 - **the UI shows the living agent loop** — the right rail rows out sandbox mode, deep-terminal state, memory facts, lessons and the context gauge (all live-updating), a header badge appears when the sandbox runs non-default, `/stats` reports the agent-loop state, and boot announces "agent loop ready · N skills installed · say <skill> <task>".
 - **ai-cli-grade turn ergonomics** — type a new prompt while a turn runs and it **queues** (slug cue in the composer box crown, then runs right after — no more "busy" rejections); the footer shows the **ctx gauge** (≈ tokens in the live history, turns amber-red past ~90k chars with a `/clear` nudge); `@file` mentions **glue a file into your message** (≤ 4 files, ≤ 240 KB each, logged as "⌘ attached"); `write`/`edit` tool calls print a compact **± diff preview** in the log; long turns tap the terminal bell when they finish; the model keeps a **visible checklist** (`todo_write`) that rides the right rail as `todo open/total`; and the whole surface got a **boxed composer** (bordered two-row prompt with a live queue cue), a `╢` rule rail, **log flash-in animation** on fresh rows, themed **toast cards** (spinner-ticked, fade out on their own — hit the `⌘` copy rows and clipboard ops), 🐭 **drag-select auto-copy** with toast, `ctrl+a` copy-whole-screen, `esc` clears the selection, and `ctrl+c` behaves Claude-style: first press copies the selection / clears the prompt, a second press exits.
 
+## 🧰 agentic toolbox
+
+The agent-loop round — context discipline, safety rails, side quests and self-repair, all key- or slash-reachable:
+
+- **context governance** (`ctrl+p` · `/ctx` · `/purge`) — the model window runs on a live tokens budget: when a turn gets long, hydra trims whole older turns out of the context face and stamps both ends (`[context: N older messages trimmed…]`) so the model knows what it dropped — the session file itself always keeps every word. `/ctx` (or the same picker) **parks and unparks whole turns** on the fly; `/purge [keep]` compacts stale exchanges after a `/time` checkpoint saves the full text first; the `ctx` rail row shows live window tokens (`ctx 12k`, `*` = parked turns in play).
+- **time travel** (`/time`) — every finished turn snapshots to `~/.hydra/checkpoints` (capped at 24). The dialog lists snapshots with a live preview; `enter` rewinds the chat and replays it turn by turn, exactly as it happened.
+- **permission zones** (`.agentrules`) — a flat file of `deny|allow|ask <regex>` lines in your repo gates every shell step the agent wants to run: `deny` blocks outright, `ask` prompts y/n in the footer, the rest falls through to the sandbox. Workspace rules shadow global ones (`~/.hydra/.agentrules`). `/zone` / `/rules` prints what's loaded.
+- **macro recording** (`ctrl+r` · `/rec` · `/macro`) — flip ctrl+r on and every shell step the agent runs is captured until you stop; `/rec <name>` writes a replayable skill into `~/.hydra/skills/macro-<name>/` and `/macro <name>` runs the steps back again.
+- **diagnostic cards + `/fix`** — when a tool call dies with a recognised error, a compact card lands in the log ("cannot find module 'x'" → suggests `npm install x`). `/diag` prints all open cards; `/fix` works the newest one through repair heuristics, parked safely after 3 failed tries.
+- **dependency radar** — right after `write`/`edit`, hydra scans the workspace for what imports the fresh file and logs the fan-out (`radar fan-out: 3 referencing src/app.js`), with `↳` file:line lines and a rail readout.
+- **lane B** (`/lane`) — a second agent runs your next prompt with its **own history clone**, streaming `‹b›` deltas side-by-side above the main turn; esc aborts it, and neither side auto-merges.
+- **ghost-write** — the composer completes from your prompt history as you type (a dim tail after the caret); `tab` accepts it.
+- **telemetry** — per-turn token counter on the footer (`tok 3 · ctx 6k`), chars/sec while a reply streams (`· 40 c/s`), rec/radar/card/fan-out lights on the right rail.
+
 ## 👼 palettes
 
 | command | look |
@@ -141,8 +155,18 @@ sequenceDiagram
 | full-text search | `/search <words>` |
 | fork from turn N | `/fork <turn>` |
 | switch palette | `/theme [name]` |
-| pause generation | `esc` |
-| build / plan mode | `ctrl+p` or `tab` |
+| pause generation | `esc` (also aborts lane B) |
+| build / plan mode | `tab` |
+| govern picker | `ctrl+p` — context budget · park/unpark · time travel · stats · diag cards in one menu |
+| park or unpark turns | `/ctx` · `ctrl+g` — kept out of the model window, back in on demand |
+| purge stale exchanges | `/purge [keep]` — runs after an automatic checkpoint, `/time` keeps the full text |
+| time travel | `/time` — rewind to any checkpoint and replay turn by turn |
+| zone rules | `.agentrules` in your repo (`deny|allow|ask <regex>`) · `/zone` / `/rules` lists them |
+| record a macro | `ctrl+r` or `/rec` · `/rec <name>` stops and saves the skill |
+| replay a macro | `/macro <name>` |
+| tool error cards | `/diag` prints them · `/fix` works the newest |
+| second agent lane | `/lane` streams a history-cloned run above the main turn · `esc` aborts |
+| prompt ghost | type a familiar prompt and `tab` completes it from your history |
 | scrollback | `pgup / pgdn`, `shift+↑/↓`, mouse wheel |
 | queue a switch mid-reply | `/sessions` works **while a turn is running** — it switches automatically after the reply |
 | `/model <n\|name>` | switch model — the list **always refreshes for the active provider**, so `qwen` and cloud models never get tangled |
@@ -170,7 +194,7 @@ sequenceDiagram
 /model                 live model list for the active provider
 ```
 
-`HYDRA_MODEL_TIMEOUT` (ms, default 180000) guards hung endpoints; `HYDRA_TOOL_TIMEOUT` (ms, default 300000) kills long-running `bash` tool calls — the UI stays live during every tool, esc interrupts immediately, and the session is saved between tool steps. `HYDRA_NO_PS=1` falls back to `cmd.exe` for `!` only.
+`HYDRA_MODEL_TIMEOUT` (ms, default 180000) guards hung endpoints; `HYDRA_TOOL_TIMEOUT` (ms, default 300000) kills long-running `bash` tool calls — the UI stays live during every tool, esc interrupts immediately, and the session is saved between tool steps. `HYDRA_NO_PS=1` falls back to `cmd.exe` for `!` only. Context-side knobs: `HYDRA_KEEP_MSGS` (model-window message cap, default 120), `HYDRA_CTX_MAX` (context-face token budget, default 60000).
 
 Nothing in the interactive paths blocks the event loop: clipboard ops are async with 3s caps, config is no longer re-read per frame, rendering skips ahead when the console can't keep up, and session saves are atomic (temp file + rename). Every run appends a one-line-per-second heartbeat (loop lag, busy label, tool count, output backlog) to `~/.hydra/heartbeat.txt` — if a session ever feels stuck, `hydra` can be diagnosed from that file alone; crashes land in `~/.hydra/crash.log`.
 
@@ -186,7 +210,7 @@ node --check hydra.mjs
 $env:HYDRA_CFG_DIR="$PWD\tmp-home"; $env:HYDRA_TEST="8"; node hydra.mjs
 ```
 
-Scenario numbers 1–17 drive the TUI end-to-end with zero human input: sessions & mouse (1–4), deep scrollback + export (5), rename (6), the custom-provider flow against a local mock `/v1/models` (7), palettes + search + fork (8), zombie-provider auto-skip (10), offline fallback (11), web injection + persistence (12), stale-popup protection (13), interrupt latency (14), skills + memory round-trip (15), sandbox y/n gating (16), skills hub install + deep-terminal cwd persistence (17), and a screenshot driver used to render the images above (9). The `docs/img/*.svg` are generated from the app's real ANSI frame stream — literally the TUI painting itself.
+Scenario numbers 1–27 drive the TUI end-to-end with zero human input: sessions & mouse (1–4), deep scrollback + export (5), rename (6), the custom-provider flow against a local mock `/v1/models` (7), palettes + search + fork (8), zombie-provider auto-skip (10), offline fallback (11), web injection + persistence (12), stale-popup protection (13), interrupt latency (14), skills + memory round-trip (15), sandbox y/n gating (16), skills hub install + deep-terminal cwd persistence (17), queued prompts + @file attach (18), full-session persistence + model-window probe (19), step-budget stop with the exchange kept (20), context budget trim + parked turns + stale purge (21), checkpoint time travel (22), .agentrules zones (23), macro record → skill (24), radar fan-out scan (25), diagnostics card + ghost-write (26), lane B streaming + telemetry (27), and a screenshot driver used to render the images above (9). The `docs/img/*.svg` are generated from the app's real ANSI frame stream — literally the TUI painting itself.
 
 ## 📄 license
 
