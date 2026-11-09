@@ -41,6 +41,18 @@ function applyTheme(name, persist = true) {
   return true;
 }
 function activeTheme() { return (CFG && THEMES[CFG.theme] && CFG.theme) || "orng"; }
+// the work LED: one dot in the footer. While the app is actually working ( streaming a reply,
+// running a tool... ) it pulses — bright core on an accent-glow backplate, lit, dimmed — so a
+// live glance tells "busy for real" apart from a stuck screen; when idle it sits as a dark dot.
+// the spinner tick redraws the footer every ~110ms while busy, which is what animates it.
+function ledOnStyles() {
+  const t = THEMES[activeTheme()] || THEMES.orng;
+  const f = Math.floor(Date.now() / 230) % 3;
+  return f === 0 ? ESC + "[0;" + t.bg + ";38;5;250m" + " \u25cf" + RESET
+    : f === 1 ? ESC + "[1;" + t.hi + "m" + " \u25cf" + RESET
+    : ESC + "[2;" + t.hi + "m" + " \u25cf" + RESET;
+}
+const ledOff = ESC + "[90m \u25cf" + RESET;   // idle: dark, quiet
 const SPINNER_FRAMES = ["\u280B", "\u2819", "\u2839", "\u2838", "\u283C", "\u2834", "\u2826", "\u2827", "\u2807", "\u280F"];
 const ANSI_RX = new RegExp(ESC + "\\[[0-9;]*[a-zA-Z]", "g");
 const cc = (style, text) => (style ? style + text + RESET : text);
@@ -1986,10 +1998,10 @@ function drawFrame() {
   const busy = UI.busy;
   const conf = UI_CONFIRM;
   const footL = conf
-    ? cc(CRIMSON + BOLD, " \u26a0 sandbox \u00b7 allow: ") + cc(DIM, clip(conf.label, Math.max(30, UI.cols - PANEL_W - 44))) + cc(CRIMSON + BOLD, "  y allow") + cc(DIM, " \u00b7 n/esc " + Math.max(0, Math.ceil(((conf.dead || Date.now() + 120000) - Date.now()) / 1000)) + "s left")
+    ? ledOnStyles() + cc(CRIMSON + BOLD, " \u26a0 sandbox \u00b7 allow: ") + cc(DIM, clip(conf.label, Math.max(30, UI.cols - PANEL_W - 44))) + cc(CRIMSON + BOLD, "  y allow") + cc(DIM, " \u00b7 n/esc " + Math.max(0, Math.ceil(((conf.dead || Date.now() + 120000) - Date.now()) / 1000)) + "s left")
     : busy
-    ? cc(CRIMSON + BOLD, " " + SPINNER_FRAMES[UI.spinner] + " " + UI.busyLabel) + cc(DIM, " " + fmtDur(Date.now() - UI.busyStart) + (Date.now() - UI.busyStart > 12000 ? " \u00b7 still working" : "") + " \u00b7 esc interrupt")
-    : " " + cc(DIM, CWD);
+    ? ledOnStyles() + cc(CRIMSON + BOLD, " " + SPINNER_FRAMES[UI.spinner] + " " + UI.busyLabel) + cc(DIM, " " + fmtDur(Date.now() - UI.busyStart) + (Date.now() - UI.busyStart > 12000 ? " \u00b7 still working" : "") + " \u00b7 esc interrupt")
+    : " " + ledOff + cc(DIM, CWD);
   let footR = busy ? (PENDING
     ? cc(CRIMSON + BOLD, " \u23f3 switching to \u201c" + clip(PENDING_NAME || "", 26) + "\u201d after this reply ")
     : (UI.QUEUE.length ? cc(DIM, " \u23f3 " + UI.QUEUE.length + " queued \u00b7 ") : "") + cc(DIM, "esc interrupt \u00b7 ctx " + ctxK() + " "))
