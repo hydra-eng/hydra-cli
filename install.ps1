@@ -1,5 +1,5 @@
 # hydra-cli one-command installer (Windows PowerShell)
-#   irm -Uri https://raw.githubusercontent.com/hydra-eng/hydra-cli/main/install.ps1 | iex
+#   irm -Uri https://raw.githubusercontent.com/hydra-eng/hydra-cli/master/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -13,7 +13,7 @@ try { $null = node --version } catch {
   exit 1
 }
 
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/hydra-eng/hydra-cli/main/hydra.mjs" -OutFile $dest -UseBasicParsing
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/hydra-eng/hydra-cli/master/hydra.mjs" -OutFile $dest -UseBasicParsing
 Write-Host "  downloaded hydra.mjs" -ForegroundColor Green
 
 node $dest --version

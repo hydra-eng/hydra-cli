@@ -81,13 +81,13 @@ Bare `/theme` opens a popup — arrow keys + `enter` apply and save the choice t
 
 ```powershell
 # Windows (PowerShell). Node >= 20. Anything OpenAI-compatible on the other side.
-irm -Uri https://raw.githubusercontent.com/hydra-eng/hydra-cli/main/install.ps1 | iex
+irm -Uri https://raw.githubusercontent.com/hydra-eng/hydra-cli/master/install.ps1 | iex
 ```
 
 …or by hand:
 
 ```powershell
-irm -Uri raw.githubusercontent.com/hydra-eng/hydra-cli/main/hydra.mjs -OutFile hydra.mjs
+irm -Uri raw.githubusercontent.com/hydra-eng/hydra-cli/master/hydra.mjs -OutFile hydra.mjs
 node hydra.mjs
 ```
 
