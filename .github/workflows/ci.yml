@@ -1,0 +1,29 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [20, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: syntax check
+        run: node --check hydra.mjs && node --check tests/plain-smoke.mjs
+      - name: banner check
+        run: node hydra.mjs --version
+      - name: manifest check
+        run: node -e "const s=require('fs').readFileSync('hydra.mjs','utf8');const t=s.match(/with on first run|grep|edit|write/g);if(!t)process.exit(1);console.log('tool surface ok')"
+      - name: plain-mode smoke (mock provider)
+        run: node tests/plain-smoke.mjs

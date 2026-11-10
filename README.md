@@ -7,15 +7,15 @@
 
 # ⬢ hydra-cli
 
-[![version](https://img.shields.io/badge/version-3.1.0-dc143c?style=flat-square)]()
+[![version](https://img.shields.io/badge/version-3.2.0-dc143c?style=flat-square)]()
+[![CI](https://github.com/hydra-eng/hydra-cli/actions/workflows/ci.yml/badge.svg?style=flat-square)](https://github.com/hydra-eng/hydra-cli/actions/workflows/ci.yml)
 [![deps](https://img.shields.io/badge/dependencies-0-2fae62?style=flat-square)]()
 [![node](https://img.shields.io/badge/node-%E2%89%A520-2fae62?style=flat-square)]()
 [![license](https://img.shields.io/badge/license-MIT-8a8a8a?style=flat-square)](LICENSE)
 
-**A cinematic, zero-dependency terminal AI CLI for Windows.** One file, `node`, nothing else.
+**a terminal AI coding agent with a real tool loop, self-written skills and cinematic session UX — one file (`hydra.mjs`), zero dependencies, `node hydra.mjs` and go.**
 
-<img width="1916" height="1078" alt="Screenshot 2026-10-25 144658" src="https://github.com/user-attachments/assets/d2bc3948-5e00-4ac7-aee7-8d07d1a8356a" />
-
+![hydra-cli in action](docs/img/demo.gif)
 
 </div>
 
@@ -24,8 +24,8 @@
 ## ✨ why hydra
 
 - **one file, zero deps** — `hydra.mjs`. No npm install, no bundlers, no framework. Run it, delete it, run it again.
-- **agentic tool use** — the model gets `bash / read / write / edit / list / glob / grep` tools and loops until the job is done.
-- **opencode-style sessions** — every turn auto-saves, `/sessions` opens a full-screen picker with a live preview pane.
+- **agentic tool use** — the model gets `bash / read / write / edit / list / glob / grep` tools and loops until the job is done. Tool steps fold into the saved reply as a `[work log]` tail, so the next turn keeps the receipts instead of redoing the same work.
+- **opencode-style sessions** — every turn auto-saves (atomic, lock-retry writes with visible failure notes), `/sessions` opens a full-screen picker with a live preview pane.
 - **full-text session search** — `/search deep dive` finds the words across every past session and drops you in a pre-filtered picker.
 - **session forking** — `/fork 30` branches a long conversation up to a chosen turn into a brand-new session, like `git branch` for chat.
 - **palettes on the fly** — `/theme` swaps the whole UI between five hand-tuned palettes, instantly and persistently.
@@ -81,6 +81,12 @@ Bare `/theme` opens a popup — arrow keys + `enter` apply and save the choice t
 
 ```powershell
 # Windows (PowerShell). Node >= 20. Anything OpenAI-compatible on the other side.
+irm -Uri https://raw.githubusercontent.com/hydra-eng/hydra-cli/main/install.ps1 | iex
+```
+
+…or by hand:
+
+```powershell
 irm -Uri raw.githubusercontent.com/hydra-eng/hydra-cli/main/hydra.mjs -OutFile hydra.mjs
 node hydra.mjs
 ```
@@ -194,7 +200,9 @@ sequenceDiagram
 /model                 live model list for the active provider
 ```
 
-`HYDRA_MODEL_TIMEOUT` (ms, default 180000) guards hung endpoints; `HYDRA_TOOL_TIMEOUT` (ms, default 300000) kills long-running `bash` tool calls — the UI stays live during every tool, esc interrupts immediately, and the session is saved between tool steps. `HYDRA_NO_PS=1` falls back to `cmd.exe` for `!` only. Context-side knobs: `HYDRA_KEEP_MSGS` (model-window message cap, default 120), `HYDRA_CTX_MAX` (context-face token budget, default 60000).
+`HYDRA_MODEL_TIMEOUT` (ms, default 180000) guards hung endpoints; `HYDRA_MODEL_IDLE` (ms, default 90000) aborts only after a stream stays truly silent (local/never-stop providers are exempt); `HYDRA_TOOL_TIMEOUT` (ms, default 300000) kills long-running `bash` tool calls — the UI stays live during every tool, esc interrupts immediately, and the session is saved between tool steps. `HYDRA_NO_PS=1` falls back to `cmd.exe` for `!` only. Context-side knobs: `HYDRA_KEEP_MSGS` (model-window message cap, default 120), `HYDRA_CTX_MAX` (context-face token budget, default 24000), `HYDRA_MAX_STEPS` (agent steps per turn, default 100).
+
+Nothing in the interactive paths blocks the event loop: clipboard ops are async with 3s caps, config is no longer re-read per frame, rendering skips ahead when the console can't keep up, and session saves are atomic (temp file + rename, lock-retry with a direct-write fallback; a save failure logs visibly). Every run appends a one-line-per-second heartbeat (loop lag, busy label, tool count, output backlog) to `~/.hydra/heartbeat.txt` — if a session ever feels stuck, `hydra` can be diagnosed from that file alone; crashes land in `~/.hydra/crash.log`.
 
 Nothing in the interactive paths blocks the event loop: clipboard ops are async with 3s caps, config is no longer re-read per frame, rendering skips ahead when the console can't keep up, and session saves are atomic (temp file + rename). Every run appends a one-line-per-second heartbeat (loop lag, busy label, tool count, output backlog) to `~/.hydra/heartbeat.txt` — if a session ever feels stuck, `hydra` can be diagnosed from that file alone; crashes land in `~/.hydra/crash.log`.
 
@@ -208,9 +216,18 @@ Every reply is atomically appended under `~/.hydra/`. Deleted sessions go to `.t
 node --check hydra.mjs
 # smoke-test scenarios (isolated config dir via HYDRA_CFG_DIR):
 $env:HYDRA_CFG_DIR="$PWD\tmp-home"; $env:HYDRA_TEST="8"; node hydra.mjs
+# ci-style smoke (mock provider, plain mode):
+node tests/plain-smoke.mjs
 ```
 
-Scenario numbers 1–27 drive the TUI end-to-end with zero human input: sessions & mouse (1–4), deep scrollback + export (5), rename (6), the custom-provider flow against a local mock `/v1/models` (7), palettes + search + fork (8), zombie-provider auto-skip (10), offline fallback (11), web injection + persistence (12), stale-popup protection (13), interrupt latency (14), skills + memory round-trip (15), sandbox y/n gating (16), skills hub install + deep-terminal cwd persistence (17), queued prompts + @file attach (18), full-session persistence + model-window probe (19), step-budget stop with the exchange kept (20), context budget trim + parked turns + stale purge (21), checkpoint time travel (22), .agentrules zones (23), macro record → skill (24), radar fan-out scan (25), diagnostics card + ghost-write (26), lane B streaming + telemetry (27), and a screenshot driver used to render the images above (9). The `docs/img/*.svg` are generated from the app's real ANSI frame stream — literally the TUI painting itself.
+Scenario numbers 1–27 drive the TUI end-to-end with zero human input: sessions & mouse (1–4), deep scrollback + export (5), rename (6), the custom-provider flow against a local mock `/v1/models` (7), palettes + search + fork (8), zombie-provider auto-skip (10), offline fallback (11), web injection + persistence (12), stale-popup protection (13), interrupt latency (14), skills + memory round-trip (15), sandbox y/n gating (16), skills hub install + deep-terminal cwd persistence (17), queued prompts + @file attach (18), full-session persistence + model-window probe (19), step-budget stop with a loud continue note + work-log fold + the receipts kept (20), context budget trim + parked turns + stale purge (21), checkpoint time travel (22), .agentrules zones (23), macro record → skill (24), radar fan-out scan (25), diagnostics card + ghost-write (26), lane B streaming + telemetry (27), and a screenshot driver used to render the images (9). The graphics in `docs/img/` come from the app's real ANSI frame stream — literally the TUI painting itself ([demo.gif](docs/img/demo.gif), [social-preview.png](docs/img/social-preview.png)).
+
+## 🤝 community
+
+- **[contribution guide](CONTRIBUTING.md)** — one file stays one file; new features ship with a proving scenario.
+- **[`good first issue` tickets](https://github.com/hydra-eng/hydra-cli/labels/good%20first%20issue)** — self-contained starter work, labeled on purpose.
+- **[discussions](https://github.com/hydra-eng/hydra-cli/discussions)** — usage questions, themes, skill sharing.
+- **[changelog](CHANGELOG.md)** — every release, in plain words.
 
 ## 📄 license
 

@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: questions & show-off sessions
+    url: https://github.com/hydra-eng/hydra-cli/discussions
+    about: usage questions, themes, skill sharing - discussions is the place

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================================
-//  HYDRA v3.1.0 - fast local coding agent - opencode-style TUI
+//  HYDRA v3.2.0 - fast local coding agent - opencode-style TUI
 //  zero dependencies | ESM | node >= 18
 //  hermes-grade: skills (SKILL.md, /learn, /hub) + memory +
 //  self-improvement loop + sandbox (y/n gating) + deep terminal
@@ -12,7 +12,7 @@ import os from "node:os";
 import readline from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
 
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
 const ESC = String.fromCharCode(27);
 let CRIMSON = ESC + "[91m";
 let CRIMSONBG = ESC + "[0;48;2;220;20;60m";
@@ -517,7 +517,9 @@ async function chatOnce(messages, provider, ondelta, signal, noTools) {
       const j = await res.json();   // non-streaming JSON endpoints still ride the idle guard
       if (!res.ok) throw new Error(j.error?.message || j.error || j.message || "HTTP " + res.status);
       const m = j.choices?.[0]?.message || {};
-      return { content: m.content || "", tool_calls: m.tool_calls || null };
+      const text0 = m.content || "";
+      if (text0 && ondelta) for (const ch of text0.match(/[\s\S]{1,24}/g) || []) ondelta(ch);
+      return { content: text0, tool_calls: m.tool_calls || null };
     }
     const decoder = new TextDecoder();
     let buf = "", content = "", reasonBuf = "";
@@ -1643,12 +1645,14 @@ function sessionsDir() { return path.join(CFG_DIR, "sessions"); }
 function sessionCount() {
   try { return fs.readdirSync(sessionsDir()).filter((f) => f.endsWith(".json")).length; } catch { return 0; }
 }
-const SKILL_DIRS = [
-  path.join(CFG_DIR, "skills"),                                          // hydra-native skills (agent can write here)
-  path.join(os.homedir(), ".config", "opencode", "skills"),
-  path.join(os.homedir(), ".claude", "skills"),
-  path.join(os.homedir(), ".agents", "skills"),
-];
+const SKILL_DIRS = process.env.HYDRA_SKILL_DIRS
+  ? String(process.env.HYDRA_SKILL_DIRS).split(";").map((s) => s.trim()).filter(Boolean)
+  : [
+    path.join(CFG_DIR, "skills"),                                          // hydra-native skills (agent can write here)
+    path.join(os.homedir(), ".config", "opencode", "skills"),
+    path.join(os.homedir(), ".claude", "skills"),
+    path.join(os.homedir(), ".agents", "skills"),
+  ];
 function skillDirsLL() { return SKILL_DIRS; }
 const SKILL_TRASH = () => path.join(CFG_DIR, "skills", ".trash");
 function safeSkillName(n) {
